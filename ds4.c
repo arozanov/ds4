@@ -35,6 +35,16 @@
 #include <unistd.h>
 
 #include "ds4.h"
+#include "ds4_turbo.h"
+
+/* Experimental: TurboQuant-encoded raw SWA KV cache.  Diagnostic only,
+ * validation in progress, not for production paths.  Enabled by setting
+ * DS4_TURBO_KV_BITS={3,4} before engine init.  When 0, the CPU KV cache
+ * uses the existing fp32-with-fp16-rounding + FP8 round-trip storage.
+ * Defined and initialized below; declared up here so the CPU attention
+ * readers (which appear before the KV cache section) can see them. */
+static int ds4_turbo_kv_bits;
+static const float *kv_turbo_decode_rows(const void *storage, uint32_t n_rows);
 
 #ifndef DS4_NO_GPU
 #include "ds4_gpu.h"
@@ -4903,6 +4913,12 @@ static void layer_attention_rows_one(
         uint32_t            n_kv) {
     const float *sinks = tensor_data(model, layer->attn_sinks);
     const float kq_scale = 1.0f / sqrtf((float)DS4_N_HEAD_DIM);
+    /* Diagnostic: when the turbo KV cache is enabled callers pass the
+     * encoded byte buffer through this float* parameter; decode once into the
+     * thread-local scratch and continue with the decoded float view. */
+    if (ds4_turbo_kv_bits && n_kv > 0) {
+        kv_rows = kv_turbo_decode_rows((const void *)kv_rows, n_kv);
+    }
     float score_stack[512];
     float *score = n_kv <= 512 ? score_stack : xmalloc((size_t)n_kv * sizeof(score[0]));
 
@@ -6091,6 +6107,77 @@ typedef struct {
     uint32_t head_dim;
 } ds4_kv_cache;
 
+static void ds4_turbo_kv_read_env(void) {
+    const char *s = getenv("DS4_TURBO_KV_BITS");
+    if (!s || !s[0]) return;
+    const int b = atoi(s);
+    if (b == 3 || b == 4) {
+        ds4_turbo_kv_bits = b;
+        ds4_turbo_kv_bits_set(b);
+        ds4_turbo_init();
+        fprintf(stderr,
+                "ds4: experimental TurboQuant KV cache enabled (%d-bit, CPU only)\n",
+                b);
+    }
+}
+
+/* Per-row layout for TurboQuant-encoded raw KV.
+ *
+ * The shipping ds4_turbo encoder requires head_dim % 128 == 0, so we encode
+ * the full 512-dim KV row and overlay the last 64 (RoPE) dims as fp16 in a
+ * trailing tail.  Decode reads turbo then overwrites the last 64 floats from
+ * the fp16 tail.  Phase 3 limitation: the 384 no-RoPE dims that fall inside
+ * the last rotation group still go through the turbo round-trip; only the
+ * trailing 64 RoPE values bypass it. */
+static inline size_t kv_turbo_row_bytes(void) {
+    if (!ds4_turbo_kv_bits) return 0;
+    return ds4_turbo_row_bytes(DS4_N_HEAD_DIM, ds4_turbo_kv_bits) +
+           (size_t)DS4_N_ROT * sizeof(uint16_t);
+}
+
+/* Encode one 512-float KV row into the turbo storage layout. */
+static void kv_turbo_encode_row(const float *src, void *dst) {
+    ds4_turbo_quantize_row(src, dst, DS4_N_HEAD_DIM, ds4_turbo_kv_bits);
+    const size_t turbo_bytes = ds4_turbo_row_bytes(DS4_N_HEAD_DIM, ds4_turbo_kv_bits);
+    uint16_t *tail = (uint16_t *)((uint8_t *)dst + turbo_bytes);
+    const uint32_t nope = DS4_N_HEAD_DIM - DS4_N_ROT;
+    for (uint32_t i = 0; i < DS4_N_ROT; i++) tail[i] = f32_to_f16(src[nope + i]);
+}
+
+/* Decode one turbo-encoded row back into a 512-float vector. */
+static void kv_turbo_decode_row(const void *src, float *dst) {
+    ds4_turbo_dequantize_row(src, dst, DS4_N_HEAD_DIM, ds4_turbo_kv_bits);
+    const size_t turbo_bytes = ds4_turbo_row_bytes(DS4_N_HEAD_DIM, ds4_turbo_kv_bits);
+    const uint16_t *tail = (const uint16_t *)((const uint8_t *)src + turbo_bytes);
+    const uint32_t nope = DS4_N_HEAD_DIM - DS4_N_ROT;
+    for (uint32_t i = 0; i < DS4_N_ROT; i++) dst[nope + i] = f16_to_f32(tail[i]);
+}
+
+/* Thread-local scratch holding the decoded view of cache->raw_kv used by the
+ * CPU attention readers when turbo is enabled.  Sized for the worst case
+ * (raw_cap == DS4_N_SWA == 128).  ~256 KB per thread; only touched on the
+ * diagnostic path. */
+#if defined(__clang__) || defined(__GNUC__)
+#define DS4_TLS __thread
+#else
+#define DS4_TLS
+#endif
+static DS4_TLS float kv_turbo_decoded[DS4_N_SWA * DS4_N_HEAD_DIM];
+
+/* Decode every live row of cache->raw_kv into the thread-local scratch and
+ * return a pointer to it.  Callers must pass the bytes buffer (cache->raw_kv
+ * cast to void*) and the live row count.  When turbo is off, callers should
+ * not invoke this helper; they continue to use the original float pointer. */
+static const float *kv_turbo_decode_rows(const void *storage, uint32_t n_rows) {
+    const size_t stride = kv_turbo_row_bytes();
+    const uint8_t *bytes = (const uint8_t *)storage;
+    for (uint32_t r = 0; r < n_rows; r++) {
+        kv_turbo_decode_row(bytes + (uint64_t)r * stride,
+                            kv_turbo_decoded + (uint64_t)r * DS4_N_HEAD_DIM);
+    }
+    return kv_turbo_decoded;
+}
+
 static uint32_t ds4_default_raw_cap(uint32_t ctx_size) {
     uint32_t raw_cap = DS4_N_SWA;
     if (raw_cap > ctx_size) raw_cap = ctx_size;
@@ -6258,7 +6345,15 @@ static void kv_cache_init(ds4_kv_cache *cache, uint32_t ctx_size, uint32_t raw_c
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         cache->layer[il].cap_raw = raw_cap;
-        cache->layer[il].raw_kv = xmalloc_zeroed((size_t)raw_cap * DS4_N_HEAD_DIM, sizeof(float));
+        /* Diagnostic: TurboQuant raw cache stores opaque per-row bytes.  We
+         * keep the field typed as float* to avoid churning every CPU reader
+         * signature; the readers swap in a decoded view at function entry. */
+        if (ds4_turbo_kv_bits) {
+            const size_t stride = kv_turbo_row_bytes();
+            cache->layer[il].raw_kv = xmalloc_zeroed((size_t)raw_cap * stride, 1);
+        } else {
+            cache->layer[il].raw_kv = xmalloc_zeroed((size_t)raw_cap * DS4_N_HEAD_DIM, sizeof(float));
+        }
         cache->layer[il].compress_ratio = ratio;
 
         if (ratio != 0) {
@@ -6305,6 +6400,19 @@ static void kv_cache_free(ds4_kv_cache *cache) {
 
 /* Append to the raw SWA cache.  Once full, it slides by one row. */
 static void kv_cache_push_raw(ds4_layer_cache *cache, const float *kv) {
+    if (ds4_turbo_kv_bits) {
+        const size_t stride = kv_turbo_row_bytes();
+        uint8_t *base = (uint8_t *)cache->raw_kv;
+        if (cache->n_raw < cache->cap_raw) {
+            kv_turbo_encode_row(kv, base + (uint64_t)cache->n_raw * stride);
+            cache->n_raw++;
+            return;
+        }
+        memmove(base, base + stride, (size_t)(cache->cap_raw - 1) * stride);
+        kv_turbo_encode_row(kv, base + (uint64_t)(cache->cap_raw - 1) * stride);
+        return;
+    }
+
     if (cache->n_raw < cache->cap_raw) {
         float *dst = cache->raw_kv + (uint64_t)cache->n_raw * DS4_N_HEAD_DIM;
         for (uint32_t i = 0; i < DS4_N_HEAD_DIM; i++) dst[i] = f16_to_f32(f32_to_f16(kv[i]));
@@ -6622,6 +6730,10 @@ static void layer_attention_mixed_one(
         const bool        * comp_allowed) {
     const float *sinks = tensor_data(model, layer->attn_sinks);
     const float kq_scale = 1.0f / sqrtf((float)DS4_N_HEAD_DIM);
+    /* Diagnostic: turbo raw cache is bytes.  Compressed rows remain fp32. */
+    if (ds4_turbo_kv_bits && n_raw > 0) {
+        raw_kv = kv_turbo_decode_rows((const void *)raw_kv, n_raw);
+    }
     const uint32_t n_total = n_raw + n_comp;
     float score_stack[512];
     float *score = n_total <= 512 ? score_stack : xmalloc((size_t)n_total * sizeof(score[0]));
@@ -6685,6 +6797,10 @@ static void layer_attention_mixed_one_decode_scratch(
         ds4_cpu_decode_scratch * scratch) {
     const float *sinks = tensor_data(model, layer->attn_sinks);
     const float kq_scale = 1.0f / sqrtf((float)DS4_N_HEAD_DIM);
+    /* Diagnostic: turbo raw cache is bytes; decode into thread-local scratch. */
+    if (ds4_turbo_kv_bits && n_raw > 0) {
+        raw_kv = kv_turbo_decode_rows((const void *)raw_kv, n_raw);
+    }
     const uint32_t n_total = n_raw + n_comp;
     if (n_total > scratch->attn_score_cap) ds4_die("CPU decode attention score scratch buffer is too small");
     float *score = scratch->attn_score;
@@ -6831,6 +6947,20 @@ static void layer_attention_prefix_batch(
         uint64_t                  allowed_stride,
         uint32_t                  n_tok,
         uint32_t                  raw_cap) {
+    /* Diagnostic: workers run in parallel and can't share the per-thread
+     * decode scratch.  Decode all live raw rows into a heap buffer up front
+     * and hand workers the float view. */
+    float *raw_decoded = NULL;
+    if (ds4_turbo_kv_bits && raw_cap > 0) {
+        raw_decoded = xmalloc((size_t)raw_cap * DS4_N_HEAD_DIM * sizeof(float));
+        const size_t stride = kv_turbo_row_bytes();
+        const uint8_t *bytes = (const uint8_t *)raw_kv;
+        for (uint32_t r = 0; r < raw_cap; r++) {
+            kv_turbo_decode_row(bytes + (uint64_t)r * stride,
+                                raw_decoded + (uint64_t)r * DS4_N_HEAD_DIM);
+        }
+        raw_kv = raw_decoded;
+    }
     layer_attention_prefix_batch_ctx ctx = {
         .out_heads = out_heads,
         .model = model,
@@ -6849,6 +6979,7 @@ static void layer_attention_prefix_batch(
                               layer_attention_prefix_batch_worker,
                               &ctx,
                               1);
+    free(raw_decoded);
 }
 
 /* Ratio-4 layers use an auxiliary indexer to select which compressed rows are
@@ -15922,6 +16053,12 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
         payload_set_err(err, errlen, "session has no valid checkpoint to save");
         return 1;
     }
+    /* Diagnostic: the turbo raw cache uses a row layout incompatible with the
+     * on-disk session format.  Refuse to serialize while the flag is set. */
+    if (ds4_turbo_kv_bits && ds4_session_is_cpu(s)) {
+        payload_set_err(err, errlen, "session payload not supported with DS4_TURBO_KV_BITS set");
+        return 1;
+    }
     if (ds4_session_is_cpu(s)) {
         const uint32_t raw_live = session_cpu_raw_live_rows(s);
         const uint32_t raw_cap = ds4_default_raw_cap((uint32_t)s->ctx_size);
@@ -16115,6 +16252,11 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
 int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, char *err, size_t errlen) {
     if (!s || !fp) {
         payload_set_err(err, errlen, "invalid session payload load");
+        return 1;
+    }
+    /* Diagnostic: see ds4_session_save_payload. */
+    if (ds4_turbo_kv_bits && ds4_session_is_cpu(s)) {
+        payload_set_err(err, errlen, "session payload not supported with DS4_TURBO_KV_BITS set");
         return 1;
     }
     uint64_t remaining = payload_bytes;
@@ -16951,6 +17093,7 @@ int ds4_engine_first_token_test(ds4_engine *e, const ds4_tokens *prompt) {
 }
 
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
+    ds4_turbo_kv_read_env();
     ds4_engine *e = xcalloc(1, sizeof(*e));
     e->model.fd = -1;
     e->mtp_model.fd = -1;
