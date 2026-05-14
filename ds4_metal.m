@@ -9437,27 +9437,18 @@ static int ds4_gpu_encode_flash_attention_prefill_static_mixed_heads_nonvec_long
         return 0;
     }
 
-    {
-        const int turbo_bits_pfnl = ds4_gpu_turbo_bits_active();
-        if (turbo_bits_pfnl) {
-            if (!ds4_gpu_encode_turbo_dequant_to_kv_scratch(cb,
-                                                             raw_kv,
-                                                             g_flash_attn_kv_buffer,
-                                                             0,
-                                                             /*raw_cap=*/n_tokens,
-                                                             /*raw_start=*/0,
-                                                             n_tokens,
-                                                             turbo_bits_pfnl)) {
-                return 0;
-            }
-        } else if (!ds4_gpu_encode_cpy_f32_f16_1d(cb,
-                                                    rawbuf,
-                                                    ds4_gpu_tensor_offset(raw_kv),
-                                                    g_flash_attn_kv_buffer,
-                                                    0,
-                                                    n_tokens * head_dim)) {
-            return 0;
-        }
+    /* This prefill variant consumes the live fp32 KV tensor (g->batch_kv),
+     * NOT the turbo-encoded layer ring. Always run the plain fp32->fp16
+     * copy here regardless of $DS4_TURBO_KV_BITS; the per-layer turbo cache
+     * is rebuilt separately by the store path. Interpreting batch_kv as
+     * turbo bytes would dequant garbage. */
+    if (!ds4_gpu_encode_cpy_f32_f16_1d(cb,
+                                         rawbuf,
+                                         ds4_gpu_tensor_offset(raw_kv),
+                                         g_flash_attn_kv_buffer,
+                                         0,
+                                         n_tokens * head_dim)) {
+        return 0;
     }
     if (n_comp &&
         !ds4_gpu_encode_cpy_f32_f16_1d(cb,
@@ -9686,27 +9677,16 @@ static int ds4_gpu_encode_flash_attention_prefill_static_mixed_heads_vec(
         return 0;
     }
 
-    {
-        const int turbo_bits_pf = ds4_gpu_turbo_bits_active();
-        if (turbo_bits_pf) {
-            if (!ds4_gpu_encode_turbo_dequant_to_kv_scratch(cb,
-                                                             raw_kv,
-                                                             g_flash_attn_kv_buffer,
-                                                             0,
-                                                             /*raw_cap=*/n_tokens,
-                                                             /*raw_start=*/0,
-                                                             n_tokens,
-                                                             turbo_bits_pf)) {
-                return 0;
-            }
-        } else if (!ds4_gpu_encode_cpy_f32_f16_1d(cb,
-                                                    rawbuf,
-                                                    ds4_gpu_tensor_offset(raw_kv),
-                                                    g_flash_attn_kv_buffer,
-                                                    0,
-                                                    n_tokens * head_dim)) {
-            return 0;
-        }
+    /* See prefill_static_mixed_heads_nonvec_long: this path also reads the
+     * fp32 batch KV tensor, not the turbo layer ring, so the f32->f16 copy
+     * is unconditional. */
+    if (!ds4_gpu_encode_cpy_f32_f16_1d(cb,
+                                         rawbuf,
+                                         ds4_gpu_tensor_offset(raw_kv),
+                                         g_flash_attn_kv_buffer,
+                                         0,
+                                         n_tokens * head_dim)) {
+        return 0;
     }
     if (n_comp) {
         if (!ds4_gpu_encode_cpy_f32_f16_1d(cb,
@@ -9983,27 +9963,15 @@ static int ds4_gpu_encode_flash_attention_prefill_raw_heads_nonvec(
                                           (int32_t)nsg);
     if (!blk_pipeline || !attn_pipeline) return 0;
 
-    {
-        const int turbo_bits_pfn = ds4_gpu_turbo_bits_active();
-        if (turbo_bits_pfn) {
-            if (!ds4_gpu_encode_turbo_dequant_to_kv_scratch(cb,
-                                                             raw_kv,
-                                                             g_flash_attn_kv_buffer,
-                                                             0,
-                                                             /*raw_cap=*/n_tokens,
-                                                             /*raw_start=*/0,
-                                                             n_tokens,
-                                                             turbo_bits_pfn)) {
-                return 0;
-            }
-        } else if (!ds4_gpu_encode_cpy_f32_f16_1d(cb,
-                                                    rawbuf,
-                                                    ds4_gpu_tensor_offset(raw_kv),
-                                                    g_flash_attn_kv_buffer,
-                                                    0,
-                                                    n_tokens * head_dim)) {
-            return 0;
-        }
+    /* Prefill raw heads (nonvec) consumes the fp32 batch KV tensor; turbo
+     * compression lives in the per-layer ring and is irrelevant here. */
+    if (!ds4_gpu_encode_cpy_f32_f16_1d(cb,
+                                         rawbuf,
+                                         ds4_gpu_tensor_offset(raw_kv),
+                                         g_flash_attn_kv_buffer,
+                                         0,
+                                         n_tokens * head_dim)) {
+        return 0;
     }
 
     if (has_kvpad) {
@@ -10205,27 +10173,15 @@ static int ds4_gpu_encode_flash_attention_prefill_raw_heads(
         ds4_gpu_get_flash_attn_reduce_pipeline((int32_t)head_dim, (int32_t)nwg);
     if (!vec_pipeline || !reduce_pipeline) return 0;
 
-    {
-        const int turbo_bits_pfv = ds4_gpu_turbo_bits_active();
-        if (turbo_bits_pfv) {
-            if (!ds4_gpu_encode_turbo_dequant_to_kv_scratch(cb,
-                                                             raw_kv,
-                                                             g_flash_attn_kv_buffer,
-                                                             kv_f16_offset,
-                                                             /*raw_cap=*/n_tokens,
-                                                             /*raw_start=*/0,
-                                                             n_tokens,
-                                                             turbo_bits_pfv)) {
-                return 0;
-            }
-        } else if (!ds4_gpu_encode_cpy_f32_f16_1d(cb,
-                                                    rawbuf,
-                                                    ds4_gpu_tensor_offset(raw_kv),
-                                                    g_flash_attn_kv_buffer,
-                                                    kv_f16_offset,
-                                                    n_tokens * head_dim)) {
-            return 0;
-        }
+    /* Prefill raw heads (short n_tokens, vector pipeline): also reads the
+     * fp32 batch KV tensor, not the turbo layer ring. */
+    if (!ds4_gpu_encode_cpy_f32_f16_1d(cb,
+                                         rawbuf,
+                                         ds4_gpu_tensor_offset(raw_kv),
+                                         g_flash_attn_kv_buffer,
+                                         kv_f16_offset,
+                                         n_tokens * head_dim)) {
+        return 0;
     }
 
     if ((n_tokens % ncpsg) != 0) {

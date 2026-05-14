@@ -6116,7 +6116,7 @@ static void ds4_turbo_kv_read_env(void) {
         ds4_turbo_kv_bits_set(b);
         ds4_turbo_init();
         fprintf(stderr,
-                "ds4: experimental TurboQuant KV cache enabled (%d-bit, CPU only)\n",
+                "ds4: experimental TurboQuant KV cache enabled (%d-bit, CPU + Metal)\n",
                 b);
     }
 }
