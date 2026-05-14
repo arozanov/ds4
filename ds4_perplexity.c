@@ -274,12 +274,26 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    /* Sync the session to the first token; this populates s->logits with
-     * the next-token distribution P(token_1 | token_0). */
-    ds4_tokens prefix = { .v = tokens.v, .len = 1, .cap = 1 };
+    /* Seed the session by feeding token_0 through the decode path.
+     *
+     * We deliberately do NOT use ds4_session_sync() with a single-token
+     * prompt here.  sync() routes single-token prompts into the Metal
+     * batched-prefill kernels, and those kernels are not exercised with
+     * batch_size==1 by any other caller (CLI/server prefill prompts always
+     * contain chat-template overhead, ds4_engine_generate_argmax() pushes
+     * the whole prompt at once).  Empirically the Metal prefill fails on
+     * a 1-token batch and returns "metal prefill failed".
+     *
+     * ds4_session_eval() instead drives metal_graph_eval_token_raw_swa(),
+     * which is the same decode kernel used for every generation step.  It
+     * happily handles pos=0 on a fresh session: the raw KV cache is
+     * allocated by ds4_session_create(), and decode at pos=0 just writes
+     * row 0 with no prefix attention to read.  After this call,
+     * s->logits holds P(. | token_0), which is exactly what we need to
+     * score token_1. */
     char err[256];
-    if (ds4_session_sync(session, &prefix, err, sizeof(err)) != 0) {
-        fprintf(stderr, "ds4_perplexity: initial sync failed: %s\n", err);
+    if (ds4_session_eval(session, tokens.v[0], err, sizeof(err)) != 0) {
+        fprintf(stderr, "ds4_perplexity: initial eval failed: %s\n", err);
         ds4_session_free(session);
         ds4_tokens_free(&tokens);
         ds4_engine_close(engine);
