@@ -79,8 +79,15 @@ static int check_roundtrip(int bits) {
     free(out);
     free(enc);
     /* 3-bit Lloyd-Max is bounded at SNR ~14.6 dB -> cos_sim ~0.98.
-     * 4-bit must clear 0.99 to confirm the codebook is wired right. */
-    const double thr = (bits == 3) ? 0.98 : 0.99;
+     * 4-bit must clear 0.99 to confirm the codebook is wired right.
+     * 6-bit clears 0.998 (SNR ~26 dB); 8-bit clears 0.9995 (SNR ~32 dB). */
+    double thr;
+    switch (bits) {
+        case 3:  thr = 0.98;   break;
+        case 4:  thr = 0.99;   break;
+        case 6:  thr = 0.998;  break;
+        default: thr = 0.9995; break;
+    }
     return (cos_sim > thr) ? 0 : 100;
 }
 
@@ -88,10 +95,13 @@ int main(void) {
     ds4_turbo_init();
     int rc3 = check_roundtrip(3);
     int rc4 = check_roundtrip(4);
+    int rc6 = check_roundtrip(6);
+    int rc8 = check_roundtrip(8);
     int rc_self = ds4_turbo_self_test();
     printf("self_test=%d\n", rc_self);
-    if (rc3 || rc4 || rc_self) {
-        fprintf(stderr, "FAIL: rc3=%d rc4=%d rc_self=%d\n", rc3, rc4, rc_self);
+    if (rc3 || rc4 || rc6 || rc8 || rc_self) {
+        fprintf(stderr, "FAIL: rc3=%d rc4=%d rc6=%d rc8=%d rc_self=%d\n",
+                rc3, rc4, rc6, rc8, rc_self);
         return 1;
     }
     printf("OK\n");

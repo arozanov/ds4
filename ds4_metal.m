@@ -6294,6 +6294,8 @@ static int ds4_gpu_turbo_trace_enabled(void) {
  *
  *   3-bit row: 16 blocks * 14 B (= 224 B) + 64 * 2 B (= 128 B) = 352 B
  *   4-bit row: 16 blocks * 18 B (= 288 B) + 64 * 2 B (= 128 B) = 416 B
+ *   6-bit row: 16 blocks * 26 B (= 416 B) + 64 * 2 B (= 128 B) = 544 B
+ *   8-bit row: 16 blocks * 34 B (= 544 B) + 64 * 2 B (= 128 B) = 672 B
  *
  * Constants are kept local to mirror the ones in ds4.c (DS4_N_HEAD_DIM,
  * DS4_N_ROT). If either changes upstream both must move together. */
@@ -6304,6 +6306,8 @@ static inline size_t ds4_gpu_turbo_block_bytes_512(int bits) {
     const int n_blocks = DS4_GPU_TURBO_HEAD_DIM / 32; /* 16 */
     if (bits == 3) return (size_t)n_blocks * 14u;
     if (bits == 4) return (size_t)n_blocks * 18u;
+    if (bits == 6) return (size_t)n_blocks * 26u;
+    if (bits == 8) return (size_t)n_blocks * 34u;
     return 0;
 }
 

@@ -142,7 +142,9 @@ int main(void) {
 
         int overall_rc = 0;
 
-        for (int bits = 3; bits <= 4; bits++) {
+        static const int bit_widths[] = {3, 4, 6, 8};
+        for (size_t bi = 0; bi < sizeof(bit_widths)/sizeof(bit_widths[0]); bi++) {
+            const int bits = bit_widths[bi];
             const size_t row_bytes = ds4_turbo_row_bytes(HEAD_DIM, bits);
             if (!row_bytes) { fprintf(stderr, "bad row_bytes\n"); overall_rc = 2; break; }
             const size_t enc_bytes = row_bytes * N_ROWS;

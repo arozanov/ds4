@@ -39,10 +39,11 @@
 
 /* Experimental: TurboQuant-encoded raw SWA KV cache.  Diagnostic only,
  * validation in progress, not for production paths.  Enabled by setting
- * DS4_TURBO_KV_BITS={3,4} before engine init.  When 0, the CPU KV cache
- * uses the existing fp32-with-fp16-rounding + FP8 round-trip storage.
- * Defined and initialized below; declared up here so the CPU attention
- * readers (which appear before the KV cache section) can see them. */
+ * DS4_TURBO_KV_BITS={3,4,6,8} before engine init.  When 0, the CPU KV
+ * cache uses the existing fp32-with-fp16-rounding + FP8 round-trip
+ * storage.  Defined and initialized below; declared up here so the CPU
+ * attention readers (which appear before the KV cache section) can see
+ * them. */
 static int ds4_turbo_kv_bits;
 static const float *kv_turbo_decode_rows(const void *storage, uint32_t n_rows);
 
@@ -6111,7 +6112,7 @@ static void ds4_turbo_kv_read_env(void) {
     const char *s = getenv("DS4_TURBO_KV_BITS");
     if (!s || !s[0]) return;
     const int b = atoi(s);
-    if (b == 3 || b == 4) {
+    if (b == 3 || b == 4 || b == 6 || b == 8) {
         ds4_turbo_kv_bits = b;
         ds4_turbo_kv_bits_set(b);
         ds4_turbo_init();

@@ -9,16 +9,20 @@
 // Encoded layout per 32-float block:
 //   - 3-bit: 2B norm + 8B qs (low 2 bits) + 4B signs (bit 2)            = 14 B
 //   - 4-bit: 2B norm + 8B qs + 4B signs + 4B qjl (bit 3)                = 18 B
+//   - 6-bit: 2B norm + 24B qs (4-index groups packed 24 bits / 3 bytes) = 26 B
+//   - 8-bit: 2B norm + 32B qs (one byte per signed codebook index)      = 34 B
 //
 // The 3-bit format is a strict prefix of the 4-bit format; the qjl
-// slot only carries the high bit of the 4-bit codebook index.
+// slot only carries the high bit of the 4-bit codebook index. The 6/8-bit
+// formats use signed codebooks (Lloyd-Max for N(0,1) spans both signs),
+// so no separate sign bits are required.
 
 #define TURBO_ROT_D    128
 #define TURBO_BLOCK    32
 
 struct ds4_metal_args_turbo {
     int32_t  head_dim;
-    int32_t  bits;          // 3 or 4 (for wht_inplace: 0 = forward, 1 = inverse)
+    int32_t  bits;          // 3/4/6/8 (for wht_inplace: 0 = forward, 1 = inverse)
     int32_t  n_rows;        // batch dispatcher; per-row kernels ignore this
     int32_t  pad;
     uint64_t row_bytes_in;  // encoded row stride in bytes (batch decode)
@@ -48,6 +52,100 @@ constant float turbo_cb4_mid[15] = {
     -0.7995f, -0.5224f, -0.2582f,  0.0000f,
      0.2582f,  0.5224f,  0.7995f,  1.0993f,
      1.4371f,  1.8435f,  2.4008f,
+};
+
+// Lloyd-Max optimal centroids for N(0, 1), 64 levels (6-bit codebook).
+constant float turbo_cb6[64] = {
+    -3.605999f, -3.085722f, -2.751095f, -2.496953f, -2.288778f, -2.110705f, -1.954065f, -1.813578f,
+    -1.685776f, -1.568258f, -1.459279f, -1.357532f, -1.262008f, -1.171905f, -1.086573f, -1.005472f,
+    -0.928148f, -0.854207f, -0.783309f, -0.715146f, -0.649445f, -0.585951f, -0.524433f, -0.464669f,
+    -0.406453f, -0.349584f, -0.293873f, -0.239131f, -0.185179f, -0.131837f, -0.078929f, -0.026281f,
+     0.026281f,  0.078929f,  0.131837f,  0.185179f,  0.239131f,  0.293873f,  0.349584f,  0.406453f,
+     0.464669f,  0.524433f,  0.585951f,  0.649445f,  0.715146f,  0.783309f,  0.854207f,  0.928148f,
+     1.005472f,  1.086573f,  1.171905f,  1.262008f,  1.357532f,  1.459279f,  1.568258f,  1.685776f,
+     1.813578f,  1.954065f,  2.110705f,  2.288778f,  2.496953f,  2.751095f,  3.085722f,  3.605999f,
+};
+
+constant float turbo_cb6_mid[63] = {
+    -3.345860f, -2.918408f, -2.624024f, -2.392865f, -2.199742f, -2.032385f, -1.883821f, -1.749677f,
+    -1.627017f, -1.513768f, -1.408405f, -1.309770f, -1.216957f, -1.129239f, -1.046022f, -0.966810f,
+    -0.891178f, -0.818758f, -0.749228f, -0.682295f, -0.617698f, -0.555192f, -0.494551f, -0.435561f,
+    -0.378018f, -0.321728f, -0.266502f, -0.212155f, -0.158508f, -0.105383f, -0.052605f,  0.000000f,
+     0.052605f,  0.105383f,  0.158508f,  0.212155f,  0.266502f,  0.321728f,  0.378018f,  0.435561f,
+     0.494551f,  0.555192f,  0.617698f,  0.682295f,  0.749228f,  0.818758f,  0.891178f,  0.966810f,
+     1.046022f,  1.129239f,  1.216957f,  1.309770f,  1.408405f,  1.513768f,  1.627017f,  1.749677f,
+     1.883821f,  2.032385f,  2.199742f,  2.392865f,  2.624024f,  2.918408f,  3.345860f,
+};
+
+// Lloyd-Max optimal centroids for N(0, 1), 256 levels (8-bit codebook).
+constant float turbo_cb8[256] = {
+    -4.035480f, -3.565625f, -3.268187f, -3.045475f, -2.865491f, -2.713551f, -2.581644f, -2.464895f,
+    -2.360107f, -2.265066f, -2.178166f, -2.098206f, -2.024257f, -1.955584f, -1.891595f, -1.831799f,
+    -1.775785f, -1.723203f, -1.673751f, -1.627164f, -1.583207f, -1.541672f, -1.502368f, -1.465126f,
+    -1.429789f, -1.396212f, -1.364264f, -1.333822f, -1.304772f, -1.277010f, -1.250438f, -1.224965f,
+    -1.200508f, -1.176989f, -1.154335f, -1.132480f, -1.111361f, -1.090923f, -1.071113f, -1.051883f,
+    -1.033188f, -1.014988f, -0.997247f, -0.979930f, -0.963006f, -0.946448f, -0.930229f, -0.914327f,
+    -0.898719f, -0.883388f, -0.868315f, -0.853484f, -0.838881f, -0.824492f, -0.810305f, -0.796310f,
+    -0.782495f, -0.768852f, -0.755371f, -0.742046f, -0.728869f, -0.715832f, -0.702931f, -0.690157f,
+    -0.677508f, -0.664976f, -0.652557f, -0.640248f, -0.628042f, -0.615938f, -0.603930f, -0.592014f,
+    -0.580189f, -0.568449f, -0.556793f, -0.545217f, -0.533718f, -0.522294f, -0.510941f, -0.499658f,
+    -0.488442f, -0.477290f, -0.466201f, -0.455172f, -0.444200f, -0.433285f, -0.422424f, -0.411614f,
+    -0.400855f, -0.390145f, -0.379481f, -0.368862f, -0.358286f, -0.347752f, -0.337259f, -0.326803f,
+    -0.316386f, -0.306003f, -0.295655f, -0.285340f, -0.275057f, -0.264803f, -0.254579f, -0.244382f,
+    -0.234211f, -0.224066f, -0.213944f, -0.203846f, -0.193768f, -0.183712f, -0.173674f, -0.163654f,
+    -0.153652f, -0.143665f, -0.133694f, -0.123736f, -0.113791f, -0.103857f, -0.093934f, -0.084021f,
+    -0.074116f, -0.064219f, -0.054328f, -0.044443f, -0.034562f, -0.024685f, -0.014810f, -0.004936f,
+     0.004936f,  0.014810f,  0.024685f,  0.034562f,  0.044443f,  0.054328f,  0.064219f,  0.074116f,
+     0.084021f,  0.093934f,  0.103857f,  0.113791f,  0.123736f,  0.133694f,  0.143665f,  0.153652f,
+     0.163654f,  0.173674f,  0.183712f,  0.193768f,  0.203846f,  0.213944f,  0.224066f,  0.234211f,
+     0.244382f,  0.254579f,  0.264803f,  0.275057f,  0.285340f,  0.295655f,  0.306003f,  0.316386f,
+     0.326803f,  0.337259f,  0.347752f,  0.358286f,  0.368862f,  0.379481f,  0.390145f,  0.400855f,
+     0.411614f,  0.422424f,  0.433285f,  0.444200f,  0.455172f,  0.466201f,  0.477290f,  0.488442f,
+     0.499658f,  0.510941f,  0.522294f,  0.533718f,  0.545217f,  0.556793f,  0.568449f,  0.580189f,
+     0.592014f,  0.603930f,  0.615938f,  0.628042f,  0.640248f,  0.652557f,  0.664976f,  0.677508f,
+     0.690157f,  0.702931f,  0.715832f,  0.728869f,  0.742046f,  0.755371f,  0.768852f,  0.782495f,
+     0.796310f,  0.810305f,  0.824492f,  0.838881f,  0.853484f,  0.868315f,  0.883388f,  0.898719f,
+     0.914327f,  0.930229f,  0.946448f,  0.963006f,  0.979930f,  0.997247f,  1.014988f,  1.033188f,
+     1.051883f,  1.071113f,  1.090923f,  1.111361f,  1.132480f,  1.154335f,  1.176989f,  1.200508f,
+     1.224965f,  1.250438f,  1.277010f,  1.304772f,  1.333822f,  1.364264f,  1.396212f,  1.429789f,
+     1.465126f,  1.502368f,  1.541672f,  1.583207f,  1.627164f,  1.673751f,  1.723203f,  1.775785f,
+     1.831799f,  1.891595f,  1.955584f,  2.024257f,  2.098206f,  2.178166f,  2.265066f,  2.360107f,
+     2.464895f,  2.581644f,  2.713551f,  2.865491f,  3.045475f,  3.268187f,  3.565625f,  4.035480f,
+};
+
+constant float turbo_cb8_mid[255] = {
+    -3.800552f, -3.416906f, -3.156831f, -2.955483f, -2.789521f, -2.647598f, -2.523269f, -2.412501f,
+    -2.312586f, -2.221616f, -2.138186f, -2.061231f, -1.989920f, -1.923590f, -1.861697f, -1.803792f,
+    -1.749494f, -1.698477f, -1.650457f, -1.605185f, -1.562439f, -1.522020f, -1.483747f, -1.447458f,
+    -1.413001f, -1.380238f, -1.349043f, -1.319297f, -1.290891f, -1.263724f, -1.237702f, -1.212737f,
+    -1.188749f, -1.165662f, -1.143407f, -1.121920f, -1.101142f, -1.081018f, -1.061498f, -1.042535f,
+    -1.024088f, -1.006118f, -0.988588f, -0.971468f, -0.954727f, -0.938338f, -0.922278f, -0.906523f,
+    -0.891054f, -0.875851f, -0.860899f, -0.846182f, -0.831686f, -0.817398f, -0.803307f, -0.789402f,
+    -0.775673f, -0.762112f, -0.748709f, -0.735458f, -0.722351f, -0.709382f, -0.696544f, -0.683833f,
+    -0.671242f, -0.658767f, -0.646402f, -0.634145f, -0.621990f, -0.609934f, -0.597972f, -0.586102f,
+    -0.574319f, -0.562621f, -0.551005f, -0.539468f, -0.528006f, -0.516618f, -0.505300f, -0.494050f,
+    -0.482866f, -0.471746f, -0.460686f, -0.449686f, -0.438743f, -0.427854f, -0.417019f, -0.406235f,
+    -0.395500f, -0.384813f, -0.374171f, -0.363574f, -0.353019f, -0.342505f, -0.332031f, -0.321594f,
+    -0.311194f, -0.300829f, -0.290498f, -0.280198f, -0.269930f, -0.259691f, -0.249480f, -0.239297f,
+    -0.229139f, -0.219005f, -0.208895f, -0.198807f, -0.188740f, -0.178693f, -0.168664f, -0.158653f,
+    -0.148659f, -0.138680f, -0.128715f, -0.118763f, -0.108824f, -0.098896f, -0.088977f, -0.079068f,
+    -0.069167f, -0.059273f, -0.049385f, -0.039502f, -0.029623f, -0.019747f, -0.009873f,  0.000000f,
+     0.009873f,  0.019747f,  0.029623f,  0.039502f,  0.049385f,  0.059273f,  0.069167f,  0.079068f,
+     0.088977f,  0.098896f,  0.108824f,  0.118763f,  0.128715f,  0.138680f,  0.148659f,  0.158653f,
+     0.168664f,  0.178693f,  0.188740f,  0.198807f,  0.208895f,  0.219005f,  0.229139f,  0.239297f,
+     0.249480f,  0.259691f,  0.269930f,  0.280198f,  0.290498f,  0.300829f,  0.311194f,  0.321594f,
+     0.332031f,  0.342505f,  0.353019f,  0.363574f,  0.374171f,  0.384813f,  0.395500f,  0.406235f,
+     0.417019f,  0.427854f,  0.438743f,  0.449686f,  0.460686f,  0.471746f,  0.482866f,  0.494050f,
+     0.505300f,  0.516618f,  0.528006f,  0.539468f,  0.551005f,  0.562621f,  0.574319f,  0.586102f,
+     0.597972f,  0.609934f,  0.621990f,  0.634145f,  0.646402f,  0.658767f,  0.671242f,  0.683833f,
+     0.696544f,  0.709382f,  0.722351f,  0.735458f,  0.748709f,  0.762112f,  0.775673f,  0.789402f,
+     0.803307f,  0.817398f,  0.831686f,  0.846182f,  0.860899f,  0.875851f,  0.891054f,  0.906523f,
+     0.922278f,  0.938338f,  0.954727f,  0.971468f,  0.988588f,  1.006118f,  1.024088f,  1.042535f,
+     1.061498f,  1.081018f,  1.101142f,  1.121920f,  1.143407f,  1.165662f,  1.188749f,  1.212737f,
+     1.237702f,  1.263724f,  1.290891f,  1.319297f,  1.349043f,  1.380238f,  1.413001f,  1.447458f,
+     1.483747f,  1.522020f,  1.562439f,  1.605185f,  1.650457f,  1.698477f,  1.749494f,  1.803792f,
+     1.861697f,  1.923590f,  1.989920f,  2.061231f,  2.138186f,  2.221616f,  2.312586f,  2.412501f,
+     2.523269f,  2.647598f,  2.789521f,  2.955483f,  3.156831f,  3.416906f,  3.800552f,
 };
 
 // WHT sign masks. These are the outputs of turbo_fill_signs() with
@@ -119,6 +217,26 @@ static int turbo_nearest4(float v) {
     return i;
 }
 
+// 6/8-bit nearest-centroid. Signed codebooks, single linear scan over
+// all thresholds. Keeps the GPU mirror branch-light at the cost of a
+// 63 / 255 iteration loop per lane; both stay short next to the WHT
+// butterfly stages.
+static int turbo_nearest6(float v) {
+    int i = 0;
+    for (int k = 0; k < 63; k++) {
+        if (v >= turbo_cb6_mid[k]) i = k + 1;
+    }
+    return i;
+}
+
+static int turbo_nearest8(float v) {
+    int i = 0;
+    for (int k = 0; k < 255; k++) {
+        if (v >= turbo_cb8_mid[k]) i = k + 1;
+    }
+    return i;
+}
+
 // IEEE 754 binary16 conversion via Metal's native half type.
 static ushort turbo_f32_to_f16_bits(float f) {
     return as_type<ushort>((half)f);
@@ -152,11 +270,15 @@ kernel void kernel_ds4_turbo_quantize_row(
     const int head_dim = args.head_dim;
     const int bits     = args.bits;
     if (head_dim <= 0 || (head_dim % TURBO_ROT_D) != 0) return;
-    if (bits != 3 && bits != 4) return;
+    if (bits != 3 && bits != 4 && bits != 6 && bits != 8) return;
 
     const int n_rot     = head_dim / TURBO_ROT_D;
     const int blocks_pg = TURBO_ROT_D / TURBO_BLOCK; // 4
-    const uint blk_bytes = (bits == 3) ? 14u : 18u;
+    uint blk_bytes;
+    if      (bits == 3) blk_bytes = 14u;
+    else if (bits == 4) blk_bytes = 18u;
+    else if (bits == 6) blk_bytes = 26u;
+    else                blk_bytes = 34u;
 
     device const float * src_row = src + (uint)row * (uint)head_dim;
     device       uchar * dst_row = dst + (uint)row * (uint)blk_bytes * (uint)(n_rot * blocks_pg);
@@ -167,6 +289,10 @@ kernel void kernel_ds4_turbo_quantize_row(
     threadgroup float * sq_buf      = scratch + 4;
     threadgroup uint  * stage       = (threadgroup uint *)(scratch + 136);
     threadgroup uint  * pack        = (threadgroup uint *)(scratch + 656);
+    // For 6/8-bit, reuse the per-lane stage area to hold the raw index
+    // (one int per lane). 128 lanes * 4 bytes fits well below the 512
+    // slots `stage` already occupies.
+    threadgroup int   * idx_buf = (threadgroup int *)stage;
 
     for (int g = 0; g < n_rot; g++) {
         // Load one rotation group; pre-multiply by signs1.
@@ -194,73 +320,109 @@ kernel void kernel_ds4_turbo_quantize_row(
 
         // Quantize.
         const float val = rot[tid] * scale;
-        const int idx = (bits == 3) ? turbo_nearest3(val) : turbo_nearest4(val);
+        int idx;
+        if      (bits == 3) idx = turbo_nearest3(val);
+        else if (bits == 4) idx = turbo_nearest4(val);
+        else if (bits == 6) idx = turbo_nearest6(val);
+        else                idx = turbo_nearest8(val);
 
-        // Stage per-lane bit contributions.
-        //   qs   = uint64 packed as two uint32 (qs_lo, qs_hi):
-        //          lane i (i < 16) contributes (idx & 3) at bit ((i & 15)*2) of qs_lo;
-        //          lane i (i >= 16) contributes (idx & 3) at bit ((i & 15)*2) of qs_hi.
-        //   signs= uint32: lane i contributes bit 2 of idx at bit position i.
-        //   qjl  = uint32 (4-bit only): lane i contributes bit 3 of idx at bit position i.
-        const uint v_lo = (uint)(idx & 0x3);
-        const uint v_b2 = (uint)((idx >> 2) & 0x1);
-        const uint v_b3 = (uint)((idx >> 3) & 0x1);
+        if (bits == 3 || bits == 4) {
+            // 3/4-bit: bit-sliced per-lane contributions ORed into 4
+            // packed uints per block (qs_lo, qs_hi, signs, qjl).
+            const uint v_lo = (uint)(idx & 0x3);
+            const uint v_b2 = (uint)((idx >> 2) & 0x1);
+            const uint v_b3 = (uint)((idx >> 3) & 0x1);
 
-        const uint qs_word_lo = (lane <  16) ? (v_lo << ((lane & 15) * 2)) : 0u;
-        const uint qs_word_hi = (lane >= 16) ? (v_lo << ((lane & 15) * 2)) : 0u;
-        const uint sg_word    = v_b2 << lane;
-        const uint qj_word    = v_b3 << lane;
+            const uint qs_word_lo = (lane <  16) ? (v_lo << ((lane & 15) * 2)) : 0u;
+            const uint qs_word_hi = (lane >= 16) ? (v_lo << ((lane & 15) * 2)) : 0u;
+            const uint sg_word    = v_b2 << lane;
+            const uint qj_word    = v_b3 << lane;
 
-        stage[tid * 4 + 0] = qs_word_lo;
-        stage[tid * 4 + 1] = qs_word_hi;
-        stage[tid * 4 + 2] = sg_word;
-        stage[tid * 4 + 3] = qj_word;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+            stage[tid * 4 + 0] = qs_word_lo;
+            stage[tid * 4 + 1] = qs_word_hi;
+            stage[tid * 4 + 2] = sg_word;
+            stage[tid * 4 + 3] = qj_word;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // OR-reduce within each 32-lane block: lanes 0..3 of each
-        // block fold the 32 contributions for their packed slot.
-        if (lane < 4) {
-            uint acc = 0u;
-            for (int j = 0; j < 32; j++) {
-                acc |= stage[(b * 32 + j) * 4 + lane];
+            // OR-reduce within each 32-lane block: lanes 0..3 of each
+            // block fold the 32 contributions for their packed slot.
+            if (lane < 4) {
+                uint acc = 0u;
+                for (int j = 0; j < 32; j++) {
+                    acc |= stage[(b * 32 + j) * 4 + lane];
+                }
+                pack[b * 4 + lane] = acc;
             }
-            pack[b * 4 + lane] = acc;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // One writer per block emits the encoded bytes. Norm is held
-        // in `norm` (broadcasted via sq_buf above, so every lane has
-        // it consistently).
-        if (lane == 0) {
-            const int block_idx = g * blocks_pg + b;
-            device uchar * blk_out = dst_row + (uint)block_idx * blk_bytes;
+            // One writer per block emits the encoded bytes.
+            if (lane == 0) {
+                const int block_idx = g * blocks_pg + b;
+                device uchar * blk_out = dst_row + (uint)block_idx * blk_bytes;
 
-            const ushort n16 = turbo_f32_to_f16_bits(norm);
-            blk_out[0] = (uchar)(n16 & 0xff);
-            blk_out[1] = (uchar)((n16 >> 8) & 0xff);
+                const ushort n16 = turbo_f32_to_f16_bits(norm);
+                blk_out[0] = (uchar)(n16 & 0xff);
+                blk_out[1] = (uchar)((n16 >> 8) & 0xff);
 
-            const uint qs_lo = pack[b * 4 + 0];
-            const uint qs_hi = pack[b * 4 + 1];
-            const uint sg    = pack[b * 4 + 2];
-            const uint qj    = pack[b * 4 + 3];
+                const uint qs_lo = pack[b * 4 + 0];
+                const uint qs_hi = pack[b * 4 + 1];
+                const uint sg    = pack[b * 4 + 2];
+                const uint qj    = pack[b * 4 + 3];
 
-            blk_out[2] = (uchar)( qs_lo        & 0xff);
-            blk_out[3] = (uchar)((qs_lo >>  8) & 0xff);
-            blk_out[4] = (uchar)((qs_lo >> 16) & 0xff);
-            blk_out[5] = (uchar)((qs_lo >> 24) & 0xff);
-            blk_out[6] = (uchar)( qs_hi        & 0xff);
-            blk_out[7] = (uchar)((qs_hi >>  8) & 0xff);
-            blk_out[8] = (uchar)((qs_hi >> 16) & 0xff);
-            blk_out[9] = (uchar)((qs_hi >> 24) & 0xff);
-            blk_out[10] = (uchar)( sg        & 0xff);
-            blk_out[11] = (uchar)((sg >>  8) & 0xff);
-            blk_out[12] = (uchar)((sg >> 16) & 0xff);
-            blk_out[13] = (uchar)((sg >> 24) & 0xff);
-            if (bits == 4) {
-                blk_out[14] = (uchar)( qj        & 0xff);
-                blk_out[15] = (uchar)((qj >>  8) & 0xff);
-                blk_out[16] = (uchar)((qj >> 16) & 0xff);
-                blk_out[17] = (uchar)((qj >> 24) & 0xff);
+                blk_out[2] = (uchar)( qs_lo        & 0xff);
+                blk_out[3] = (uchar)((qs_lo >>  8) & 0xff);
+                blk_out[4] = (uchar)((qs_lo >> 16) & 0xff);
+                blk_out[5] = (uchar)((qs_lo >> 24) & 0xff);
+                blk_out[6] = (uchar)( qs_hi        & 0xff);
+                blk_out[7] = (uchar)((qs_hi >>  8) & 0xff);
+                blk_out[8] = (uchar)((qs_hi >> 16) & 0xff);
+                blk_out[9] = (uchar)((qs_hi >> 24) & 0xff);
+                blk_out[10] = (uchar)( sg        & 0xff);
+                blk_out[11] = (uchar)((sg >>  8) & 0xff);
+                blk_out[12] = (uchar)((sg >> 16) & 0xff);
+                blk_out[13] = (uchar)((sg >> 24) & 0xff);
+                if (bits == 4) {
+                    blk_out[14] = (uchar)( qj        & 0xff);
+                    blk_out[15] = (uchar)((qj >>  8) & 0xff);
+                    blk_out[16] = (uchar)((qj >> 16) & 0xff);
+                    blk_out[17] = (uchar)((qj >> 24) & 0xff);
+                }
+            }
+        } else {
+            // 6/8-bit: each lane stashes its full index, then a small
+            // crew of lanes per block writes the packed payload bytes.
+            // No bit-slicing -- 6-bit packs 4 indices per 3 bytes, 8-bit
+            // is one byte per index.
+            idx_buf[tid] = idx;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (lane == 0) {
+                const int block_idx = g * blocks_pg + b;
+                device uchar * blk_out = dst_row + (uint)block_idx * blk_bytes;
+
+                const ushort n16 = turbo_f32_to_f16_bits(norm);
+                blk_out[0] = (uchar)(n16 & 0xff);
+                blk_out[1] = (uchar)((n16 >> 8) & 0xff);
+
+                if (bits == 8) {
+                    // Trivial: 32 bytes, one per index.
+                    for (int i = 0; i < TURBO_BLOCK; i++) {
+                        blk_out[2 + i] = (uchar)(idx_buf[b * 32 + i] & 0xff);
+                    }
+                } else {
+                    // 6-bit: pack groups of 4 indices into 3 bytes.
+                    // word = a | (b << 6) | (c << 12) | (d << 18).
+                    for (int gi = 0; gi < TURBO_BLOCK / 4; gi++) {
+                        const uint a = (uint)(idx_buf[b * 32 + 4*gi + 0] & 0x3f);
+                        const uint bb = (uint)(idx_buf[b * 32 + 4*gi + 1] & 0x3f);
+                        const uint c = (uint)(idx_buf[b * 32 + 4*gi + 2] & 0x3f);
+                        const uint d = (uint)(idx_buf[b * 32 + 4*gi + 3] & 0x3f);
+                        const uint w = a | (bb << 6) | (c << 12) | (d << 18);
+                        blk_out[2 + 3*gi + 0] = (uchar)( w        & 0xff);
+                        blk_out[2 + 3*gi + 1] = (uchar)((w >>  8) & 0xff);
+                        blk_out[2 + 3*gi + 2] = (uchar)((w >> 16) & 0xff);
+                    }
+                }
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -282,7 +444,11 @@ static void turbo_dequant_group(
         int bits,
         ushort tid) {
     const int blocks_pg = TURBO_ROT_D / TURBO_BLOCK;
-    const uint blk_bytes = (bits == 3) ? 14u : 18u;
+    uint blk_bytes;
+    if      (bits == 3) blk_bytes = 14u;
+    else if (bits == 4) blk_bytes = 18u;
+    else if (bits == 6) blk_bytes = 26u;
+    else                blk_bytes = 34u;
 
     const ushort b    = tid >> 5;
     const ushort lane = tid & 31;
@@ -298,20 +464,39 @@ static void turbo_dequant_group(
 
     const float inv_scale = norms_tg[b] * (1.0f / sqrt((float)TURBO_BLOCK));
 
-    const uchar qs_byte = blk[2 + (lane >> 2)];
-    const uchar sg_byte = blk[10 + (lane >> 3)];
-    const uchar lo      = (qs_byte >> ((lane & 3) * 2)) & 0x3;
-    const uchar hi      = (sg_byte >> (lane & 7)) & 0x1;
     int idx;
-    if (bits == 3) {
-        idx = (int)(lo | (hi << 2));
+    float c;
+    if (bits == 3 || bits == 4) {
+        const uchar qs_byte = blk[2 + (lane >> 2)];
+        const uchar sg_byte = blk[10 + (lane >> 3)];
+        const uchar lo      = (qs_byte >> ((lane & 3) * 2)) & 0x3;
+        const uchar hi      = (sg_byte >> (lane & 7)) & 0x1;
+        if (bits == 3) {
+            idx = (int)(lo | (hi << 2));
+            c = turbo_cb3[idx];
+        } else {
+            const uchar qj_byte = blk[14 + (lane >> 3)];
+            const uchar hi2 = (qj_byte >> (lane & 7)) & 0x1;
+            idx = (int)(lo | (hi << 2) | (hi2 << 3));
+            c = turbo_cb4[idx];
+        }
+    } else if (bits == 6) {
+        // Each 4-lane group decodes 3 bytes back into 4 6-bit indices.
+        const ushort gi = lane >> 2;    // group within block (0..7)
+        const ushort sl = lane & 3;     // lane within group (0..3)
+        const uint base = 2u + (uint)gi * 3u;
+        const uint w =
+            (uint)blk[base + 0]        |
+            ((uint)blk[base + 1] <<  8) |
+            ((uint)blk[base + 2] << 16);
+        idx = (int)((w >> (sl * 6)) & 0x3fu);
+        c = turbo_cb6[idx];
     } else {
-        const uchar qj_byte = blk[14 + (lane >> 3)];
-        const uchar hi2 = (qj_byte >> (lane & 7)) & 0x1;
-        idx = (int)(lo | (hi << 2) | (hi2 << 3));
+        // 8-bit: one byte per index.
+        idx = (int)blk[2 + lane];
+        c = turbo_cb8[idx];
     }
 
-    const float c = (bits == 3) ? turbo_cb3[idx] : turbo_cb4[idx];
     rot[tid] = c * inv_scale;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -338,11 +523,15 @@ kernel void kernel_ds4_turbo_dequantize_row(
     const int head_dim = args.head_dim;
     const int bits     = args.bits;
     if (head_dim <= 0 || (head_dim % TURBO_ROT_D) != 0) return;
-    if (bits != 3 && bits != 4) return;
+    if (bits != 3 && bits != 4 && bits != 6 && bits != 8) return;
 
     const int n_rot     = head_dim / TURBO_ROT_D;
     const int blocks_pg = TURBO_ROT_D / TURBO_BLOCK;
-    const uint blk_bytes = (bits == 3) ? 14u : 18u;
+    uint blk_bytes;
+    if      (bits == 3) blk_bytes = 14u;
+    else if (bits == 4) blk_bytes = 18u;
+    else if (bits == 6) blk_bytes = 26u;
+    else                blk_bytes = 34u;
     const uint row_bytes = (uint)blk_bytes * (uint)(n_rot * blocks_pg);
 
     device const uchar * row_in  = src + (uint)row * row_bytes;
@@ -371,7 +560,7 @@ kernel void kernel_ds4_turbo_dequantize_batch(
     const int head_dim = args.head_dim;
     const int bits     = args.bits;
     if (head_dim <= 0 || (head_dim % TURBO_ROT_D) != 0) return;
-    if (bits != 3 && bits != 4) return;
+    if (bits != 3 && bits != 4 && bits != 6 && bits != 8) return;
 
     const int n_rot          = head_dim / TURBO_ROT_D;
     const uint row_bytes_in  = (uint)args.row_bytes_in;

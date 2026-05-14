@@ -1,8 +1,10 @@
 /* TurboQuant KV cache compression for DeepSeek V4.
  *
- * Two formats, both intended for head_dim = 512 rows:
+ * Four formats, all intended for head_dim = 512 rows:
  *   - 3-bit: per-block L2 norm (fp16) + 3-bit codebook index per value.
  *   - 4-bit: per-block L2 norm (fp16) + 4-bit codebook index per value.
+ *   - 6-bit: per-block L2 norm (fp16) + 6-bit codebook index per value.
+ *   - 8-bit: per-block L2 norm (fp16) + 8-bit codebook index per value.
  *
  * Pre-processing rotates each 128-float chunk via a normalized fast
  * Walsh-Hadamard transform sandwiched between two random sign masks. WHT
@@ -28,6 +30,11 @@
  *     the high bit of a 4-bit index. 18 bytes. The qs / signs / qjl_sign
  *     split is inherited from the QJL-flavored variant; here we use it
  *     just as a bit-sliced 4-bit codebook index.
+ *   - 6-bit: 2B norm + 24B qs (32 values * 6 bits = 192 bits, packed
+ *     little-endian). 26 bytes. No separate sign bits; the codebook is
+ *     fully signed (Lloyd-Max for N(0,1), symmetric over zero).
+ *   - 8-bit: 2B norm + 32B qs (one byte per index). 34 bytes. Same
+ *     rationale: signed codebook, no auxiliary bits.
  */
 
 #include "ds4_turbo.h"
@@ -71,6 +78,103 @@ static const float turbo_cb4_mid[15] = {
      1.4371f,  1.8435f,  2.4008f,
 };
 
+/* Lloyd-Max optimal centroids for N(0, 1), 64 levels (6-bit codebook).
+ * Distortion D ~ 0.00239 -> SNR ~ 26.2 dB. Codebook is symmetric and
+ * spans both signs, so no separate sign bit is required. */
+static const float turbo_cb6[64] = {
+    -3.605999f, -3.085722f, -2.751095f, -2.496953f, -2.288778f, -2.110705f, -1.954065f, -1.813578f,
+    -1.685776f, -1.568258f, -1.459279f, -1.357532f, -1.262008f, -1.171905f, -1.086573f, -1.005472f,
+    -0.928148f, -0.854207f, -0.783309f, -0.715146f, -0.649445f, -0.585951f, -0.524433f, -0.464669f,
+    -0.406453f, -0.349584f, -0.293873f, -0.239131f, -0.185179f, -0.131837f, -0.078929f, -0.026281f,
+     0.026281f,  0.078929f,  0.131837f,  0.185179f,  0.239131f,  0.293873f,  0.349584f,  0.406453f,
+     0.464669f,  0.524433f,  0.585951f,  0.649445f,  0.715146f,  0.783309f,  0.854207f,  0.928148f,
+     1.005472f,  1.086573f,  1.171905f,  1.262008f,  1.357532f,  1.459279f,  1.568258f,  1.685776f,
+     1.813578f,  1.954065f,  2.110705f,  2.288778f,  2.496953f,  2.751095f,  3.085722f,  3.605999f,
+};
+
+static const float turbo_cb6_mid[63] = {
+    -3.345860f, -2.918408f, -2.624024f, -2.392865f, -2.199742f, -2.032385f, -1.883821f, -1.749677f,
+    -1.627017f, -1.513768f, -1.408405f, -1.309770f, -1.216957f, -1.129239f, -1.046022f, -0.966810f,
+    -0.891178f, -0.818758f, -0.749228f, -0.682295f, -0.617698f, -0.555192f, -0.494551f, -0.435561f,
+    -0.378018f, -0.321728f, -0.266502f, -0.212155f, -0.158508f, -0.105383f, -0.052605f,  0.000000f,
+     0.052605f,  0.105383f,  0.158508f,  0.212155f,  0.266502f,  0.321728f,  0.378018f,  0.435561f,
+     0.494551f,  0.555192f,  0.617698f,  0.682295f,  0.749228f,  0.818758f,  0.891178f,  0.966810f,
+     1.046022f,  1.129239f,  1.216957f,  1.309770f,  1.408405f,  1.513768f,  1.627017f,  1.749677f,
+     1.883821f,  2.032385f,  2.199742f,  2.392865f,  2.624024f,  2.918408f,  3.345860f,
+};
+
+/* Lloyd-Max optimal centroids for N(0, 1), 256 levels (8-bit codebook).
+ * Distortion D ~ 0.000597 -> SNR ~ 32.2 dB. */
+static const float turbo_cb8[256] = {
+    -4.035480f, -3.565625f, -3.268187f, -3.045475f, -2.865491f, -2.713551f, -2.581644f, -2.464895f,
+    -2.360107f, -2.265066f, -2.178166f, -2.098206f, -2.024257f, -1.955584f, -1.891595f, -1.831799f,
+    -1.775785f, -1.723203f, -1.673751f, -1.627164f, -1.583207f, -1.541672f, -1.502368f, -1.465126f,
+    -1.429789f, -1.396212f, -1.364264f, -1.333822f, -1.304772f, -1.277010f, -1.250438f, -1.224965f,
+    -1.200508f, -1.176989f, -1.154335f, -1.132480f, -1.111361f, -1.090923f, -1.071113f, -1.051883f,
+    -1.033188f, -1.014988f, -0.997247f, -0.979930f, -0.963006f, -0.946448f, -0.930229f, -0.914327f,
+    -0.898719f, -0.883388f, -0.868315f, -0.853484f, -0.838881f, -0.824492f, -0.810305f, -0.796310f,
+    -0.782495f, -0.768852f, -0.755371f, -0.742046f, -0.728869f, -0.715832f, -0.702931f, -0.690157f,
+    -0.677508f, -0.664976f, -0.652557f, -0.640248f, -0.628042f, -0.615938f, -0.603930f, -0.592014f,
+    -0.580189f, -0.568449f, -0.556793f, -0.545217f, -0.533718f, -0.522294f, -0.510941f, -0.499658f,
+    -0.488442f, -0.477290f, -0.466201f, -0.455172f, -0.444200f, -0.433285f, -0.422424f, -0.411614f,
+    -0.400855f, -0.390145f, -0.379481f, -0.368862f, -0.358286f, -0.347752f, -0.337259f, -0.326803f,
+    -0.316386f, -0.306003f, -0.295655f, -0.285340f, -0.275057f, -0.264803f, -0.254579f, -0.244382f,
+    -0.234211f, -0.224066f, -0.213944f, -0.203846f, -0.193768f, -0.183712f, -0.173674f, -0.163654f,
+    -0.153652f, -0.143665f, -0.133694f, -0.123736f, -0.113791f, -0.103857f, -0.093934f, -0.084021f,
+    -0.074116f, -0.064219f, -0.054328f, -0.044443f, -0.034562f, -0.024685f, -0.014810f, -0.004936f,
+     0.004936f,  0.014810f,  0.024685f,  0.034562f,  0.044443f,  0.054328f,  0.064219f,  0.074116f,
+     0.084021f,  0.093934f,  0.103857f,  0.113791f,  0.123736f,  0.133694f,  0.143665f,  0.153652f,
+     0.163654f,  0.173674f,  0.183712f,  0.193768f,  0.203846f,  0.213944f,  0.224066f,  0.234211f,
+     0.244382f,  0.254579f,  0.264803f,  0.275057f,  0.285340f,  0.295655f,  0.306003f,  0.316386f,
+     0.326803f,  0.337259f,  0.347752f,  0.358286f,  0.368862f,  0.379481f,  0.390145f,  0.400855f,
+     0.411614f,  0.422424f,  0.433285f,  0.444200f,  0.455172f,  0.466201f,  0.477290f,  0.488442f,
+     0.499658f,  0.510941f,  0.522294f,  0.533718f,  0.545217f,  0.556793f,  0.568449f,  0.580189f,
+     0.592014f,  0.603930f,  0.615938f,  0.628042f,  0.640248f,  0.652557f,  0.664976f,  0.677508f,
+     0.690157f,  0.702931f,  0.715832f,  0.728869f,  0.742046f,  0.755371f,  0.768852f,  0.782495f,
+     0.796310f,  0.810305f,  0.824492f,  0.838881f,  0.853484f,  0.868315f,  0.883388f,  0.898719f,
+     0.914327f,  0.930229f,  0.946448f,  0.963006f,  0.979930f,  0.997247f,  1.014988f,  1.033188f,
+     1.051883f,  1.071113f,  1.090923f,  1.111361f,  1.132480f,  1.154335f,  1.176989f,  1.200508f,
+     1.224965f,  1.250438f,  1.277010f,  1.304772f,  1.333822f,  1.364264f,  1.396212f,  1.429789f,
+     1.465126f,  1.502368f,  1.541672f,  1.583207f,  1.627164f,  1.673751f,  1.723203f,  1.775785f,
+     1.831799f,  1.891595f,  1.955584f,  2.024257f,  2.098206f,  2.178166f,  2.265066f,  2.360107f,
+     2.464895f,  2.581644f,  2.713551f,  2.865491f,  3.045475f,  3.268187f,  3.565625f,  4.035480f,
+};
+
+static const float turbo_cb8_mid[255] = {
+    -3.800552f, -3.416906f, -3.156831f, -2.955483f, -2.789521f, -2.647598f, -2.523269f, -2.412501f,
+    -2.312586f, -2.221616f, -2.138186f, -2.061231f, -1.989920f, -1.923590f, -1.861697f, -1.803792f,
+    -1.749494f, -1.698477f, -1.650457f, -1.605185f, -1.562439f, -1.522020f, -1.483747f, -1.447458f,
+    -1.413001f, -1.380238f, -1.349043f, -1.319297f, -1.290891f, -1.263724f, -1.237702f, -1.212737f,
+    -1.188749f, -1.165662f, -1.143407f, -1.121920f, -1.101142f, -1.081018f, -1.061498f, -1.042535f,
+    -1.024088f, -1.006118f, -0.988588f, -0.971468f, -0.954727f, -0.938338f, -0.922278f, -0.906523f,
+    -0.891054f, -0.875851f, -0.860899f, -0.846182f, -0.831686f, -0.817398f, -0.803307f, -0.789402f,
+    -0.775673f, -0.762112f, -0.748709f, -0.735458f, -0.722351f, -0.709382f, -0.696544f, -0.683833f,
+    -0.671242f, -0.658767f, -0.646402f, -0.634145f, -0.621990f, -0.609934f, -0.597972f, -0.586102f,
+    -0.574319f, -0.562621f, -0.551005f, -0.539468f, -0.528006f, -0.516618f, -0.505300f, -0.494050f,
+    -0.482866f, -0.471746f, -0.460686f, -0.449686f, -0.438743f, -0.427854f, -0.417019f, -0.406235f,
+    -0.395500f, -0.384813f, -0.374171f, -0.363574f, -0.353019f, -0.342505f, -0.332031f, -0.321594f,
+    -0.311194f, -0.300829f, -0.290498f, -0.280198f, -0.269930f, -0.259691f, -0.249480f, -0.239297f,
+    -0.229139f, -0.219005f, -0.208895f, -0.198807f, -0.188740f, -0.178693f, -0.168664f, -0.158653f,
+    -0.148659f, -0.138680f, -0.128715f, -0.118763f, -0.108824f, -0.098896f, -0.088977f, -0.079068f,
+    -0.069167f, -0.059273f, -0.049385f, -0.039502f, -0.029623f, -0.019747f, -0.009873f,  0.000000f,
+     0.009873f,  0.019747f,  0.029623f,  0.039502f,  0.049385f,  0.059273f,  0.069167f,  0.079068f,
+     0.088977f,  0.098896f,  0.108824f,  0.118763f,  0.128715f,  0.138680f,  0.148659f,  0.158653f,
+     0.168664f,  0.178693f,  0.188740f,  0.198807f,  0.208895f,  0.219005f,  0.229139f,  0.239297f,
+     0.249480f,  0.259691f,  0.269930f,  0.280198f,  0.290498f,  0.300829f,  0.311194f,  0.321594f,
+     0.332031f,  0.342505f,  0.353019f,  0.363574f,  0.374171f,  0.384813f,  0.395500f,  0.406235f,
+     0.417019f,  0.427854f,  0.438743f,  0.449686f,  0.460686f,  0.471746f,  0.482866f,  0.494050f,
+     0.505300f,  0.516618f,  0.528006f,  0.539468f,  0.551005f,  0.562621f,  0.574319f,  0.586102f,
+     0.597972f,  0.609934f,  0.621990f,  0.634145f,  0.646402f,  0.658767f,  0.671242f,  0.683833f,
+     0.696544f,  0.709382f,  0.722351f,  0.735458f,  0.748709f,  0.762112f,  0.775673f,  0.789402f,
+     0.803307f,  0.817398f,  0.831686f,  0.846182f,  0.860899f,  0.875851f,  0.891054f,  0.906523f,
+     0.922278f,  0.938338f,  0.954727f,  0.971468f,  0.988588f,  1.006118f,  1.024088f,  1.042535f,
+     1.061498f,  1.081018f,  1.101142f,  1.121920f,  1.143407f,  1.165662f,  1.188749f,  1.212737f,
+     1.237702f,  1.263724f,  1.290891f,  1.319297f,  1.349043f,  1.380238f,  1.413001f,  1.447458f,
+     1.483747f,  1.522020f,  1.562439f,  1.605185f,  1.650457f,  1.698477f,  1.749494f,  1.803792f,
+     1.861697f,  1.923590f,  1.989920f,  2.061231f,  2.138186f,  2.221616f,  2.312586f,  2.412501f,
+     2.523269f,  2.647598f,  2.789521f,  2.955483f,  3.156831f,  3.416906f,  3.800552f,
+};
+
 /* Lazy-initialized random sign masks. Two 128-element +/-1 masks
  * (applied before and after the WHT) turn the deterministic transform
  * into a random-feeling orthonormal map without storing a dense
@@ -111,7 +215,8 @@ int ds4_turbo_kv_bits_get(void) {
 }
 
 void ds4_turbo_kv_bits_set(int bits) {
-    turbo_kv_bits_cached = (bits == 3 || bits == 4) ? bits : 0;
+    turbo_kv_bits_cached =
+        (bits == 3 || bits == 4 || bits == 6 || bits == 8) ? bits : 0;
 }
 
 /* Portable IEEE 754 binary16 conversion. We do not require the host
@@ -223,11 +328,32 @@ static int turbo_nearest4(float v) {
     return i;
 }
 
+/* 6/8-bit codebooks span both signs so the encoder runs the full
+ * threshold scan over all centroids. The lists are sorted, so a linear
+ * scan over 63 (resp. 255) midpoints is still vectorizable; binary
+ * search is a wash at this size and would complicate the GPU mirror. */
+static int turbo_nearest6(float v) {
+    int i = 0;
+    while (i < 63 && v >= turbo_cb6_mid[i]) i++;
+    return i;
+}
+
+static int turbo_nearest8(float v) {
+    int i = 0;
+    while (i < 255 && v >= turbo_cb8_mid[i]) i++;
+    return i;
+}
+
 size_t ds4_turbo_row_bytes(int head_dim, int bits) {
     if (head_dim <= 0 || (head_dim % TURBO_BLOCK) != 0) return 0;
     const int nb = head_dim / TURBO_BLOCK;
+    /* 2B norm + per-block index payload. The 3/4-bit formats split the
+     * codebook index into qs/signs/qjl slots; 6/8-bit pack the full
+     * signed index inline (no sign bits, codebook is symmetric). */
     if (bits == 3) return (size_t)nb * 14u;
     if (bits == 4) return (size_t)nb * 18u;
+    if (bits == 6) return (size_t)nb * 26u; /* 2B norm + 24B qs */
+    if (bits == 8) return (size_t)nb * 34u; /* 2B norm + 32B qs */
     return 0;
 }
 
@@ -284,6 +410,48 @@ static void turbo_unpack_block4(const uint8_t *qs, const uint8_t *signs,
     }
 }
 
+/* 6-bit packing: 32 values * 6 bits = 192 bits = 24 bytes.
+ * Pack 4 indices (24 bits) into 3 bytes, little-endian. The 32 indices
+ * therefore split into 8 groups of 4, each occupying 3 bytes.
+ *
+ * For group g of 4 indices (a, b, c, d), the 24-bit word is
+ *   word = a | (b << 6) | (c << 12) | (d << 18)
+ * stored as little-endian bytes (qs[3g+0..3g+2]). */
+static void turbo_pack_block6(const uint8_t *idx, uint8_t *qs) {
+    for (int g = 0; g < TURBO_BLOCK / 4; g++) {
+        const uint32_t a = idx[4*g + 0] & 0x3fu;
+        const uint32_t b = idx[4*g + 1] & 0x3fu;
+        const uint32_t c = idx[4*g + 2] & 0x3fu;
+        const uint32_t d = idx[4*g + 3] & 0x3fu;
+        const uint32_t w = a | (b << 6) | (c << 12) | (d << 18);
+        qs[3*g + 0] = (uint8_t)( w        & 0xffu);
+        qs[3*g + 1] = (uint8_t)((w >>  8) & 0xffu);
+        qs[3*g + 2] = (uint8_t)((w >> 16) & 0xffu);
+    }
+}
+
+static void turbo_unpack_block6(const uint8_t *qs, uint8_t *idx) {
+    for (int g = 0; g < TURBO_BLOCK / 4; g++) {
+        const uint32_t w =
+            (uint32_t)qs[3*g + 0]        |
+            ((uint32_t)qs[3*g + 1] <<  8) |
+            ((uint32_t)qs[3*g + 2] << 16);
+        idx[4*g + 0] = (uint8_t)( w        & 0x3fu);
+        idx[4*g + 1] = (uint8_t)((w >>  6) & 0x3fu);
+        idx[4*g + 2] = (uint8_t)((w >> 12) & 0x3fu);
+        idx[4*g + 3] = (uint8_t)((w >> 18) & 0x3fu);
+    }
+}
+
+/* 8-bit packing: one byte per index. Trivial. */
+static void turbo_pack_block8(const uint8_t *idx, uint8_t *qs) {
+    memcpy(qs, idx, TURBO_BLOCK);
+}
+
+static void turbo_unpack_block8(const uint8_t *qs, uint8_t *idx) {
+    memcpy(idx, qs, TURBO_BLOCK);
+}
+
 /* Encode one head_dim-long row. Layout per row:
  *   - head_dim / 128 rotation groups, each rotated independently with
  *     the same shared sign masks;
@@ -297,10 +465,16 @@ void ds4_turbo_quantize_row(const float *src, void *dst,
                             int head_dim, int bits) {
     if (!turbo_initialized) ds4_turbo_init();
     if (head_dim <= 0 || (head_dim % TURBO_ROT_D) != 0) return;
-    if (bits != 3 && bits != 4) return;
+    if (bits != 3 && bits != 4 && bits != 6 && bits != 8) return;
 
     const int n_rot = head_dim / TURBO_ROT_D;
-    const size_t blk_bytes = (bits == 3) ? 14u : 18u;
+    size_t blk_bytes;
+    switch (bits) {
+        case 3: blk_bytes = 14u; break;
+        case 4: blk_bytes = 18u; break;
+        case 6: blk_bytes = 26u; break;
+        default: blk_bytes = 34u; break; /* bits == 8 */
+    }
 
     float rot[TURBO_ROT_D];
     uint8_t *out = (uint8_t *)dst;
@@ -323,23 +497,45 @@ void ds4_turbo_quantize_row(const float *src, void *dst,
             float scale = (norm > 1e-12f) ? (sqrtf((float)TURBO_BLOCK) / norm) : 0.0f;
 
             uint8_t idx[TURBO_BLOCK];
-            if (bits == 3) {
-                for (int i = 0; i < TURBO_BLOCK; i++) {
-                    idx[i] = (uint8_t)turbo_nearest3(blk[i] * scale);
-                }
-            } else {
-                for (int i = 0; i < TURBO_BLOCK; i++) {
-                    idx[i] = (uint8_t)turbo_nearest4(blk[i] * scale);
-                }
+            switch (bits) {
+                case 3:
+                    for (int i = 0; i < TURBO_BLOCK; i++) {
+                        idx[i] = (uint8_t)turbo_nearest3(blk[i] * scale);
+                    }
+                    break;
+                case 4:
+                    for (int i = 0; i < TURBO_BLOCK; i++) {
+                        idx[i] = (uint8_t)turbo_nearest4(blk[i] * scale);
+                    }
+                    break;
+                case 6:
+                    for (int i = 0; i < TURBO_BLOCK; i++) {
+                        idx[i] = (uint8_t)turbo_nearest6(blk[i] * scale);
+                    }
+                    break;
+                default: /* 8 */
+                    for (int i = 0; i < TURBO_BLOCK; i++) {
+                        idx[i] = (uint8_t)turbo_nearest8(blk[i] * scale);
+                    }
+                    break;
             }
 
             uint16_t n16 = turbo_f32_to_f16(norm);
             blk_out[0] = (uint8_t)(n16 & 0xffu);
             blk_out[1] = (uint8_t)((n16 >> 8) & 0xffu);
-            if (bits == 3) {
-                turbo_pack_block3(idx, blk_out + 2, blk_out + 10);
-            } else {
-                turbo_pack_block4(idx, blk_out + 2, blk_out + 10, blk_out + 14);
+            switch (bits) {
+                case 3:
+                    turbo_pack_block3(idx, blk_out + 2, blk_out + 10);
+                    break;
+                case 4:
+                    turbo_pack_block4(idx, blk_out + 2, blk_out + 10, blk_out + 14);
+                    break;
+                case 6:
+                    turbo_pack_block6(idx, blk_out + 2);
+                    break;
+                default: /* 8 */
+                    turbo_pack_block8(idx, blk_out + 2);
+                    break;
             }
         }
     }
@@ -352,10 +548,16 @@ void ds4_turbo_dequantize_row(const void *src, float *dst,
                               int head_dim, int bits) {
     if (!turbo_initialized) ds4_turbo_init();
     if (head_dim <= 0 || (head_dim % TURBO_ROT_D) != 0) return;
-    if (bits != 3 && bits != 4) return;
+    if (bits != 3 && bits != 4 && bits != 6 && bits != 8) return;
 
     const int n_rot = head_dim / TURBO_ROT_D;
-    const size_t blk_bytes = (bits == 3) ? 14u : 18u;
+    size_t blk_bytes;
+    switch (bits) {
+        case 3: blk_bytes = 14u; break;
+        case 4: blk_bytes = 18u; break;
+        case 6: blk_bytes = 26u; break;
+        default: blk_bytes = 34u; break;
+    }
     const uint8_t *in = (const uint8_t *)src;
 
     float rot[TURBO_ROT_D];
@@ -369,16 +571,31 @@ void ds4_turbo_dequantize_row(const void *src, float *dst,
             float inv_scale = norm * (1.0f / sqrtf((float)TURBO_BLOCK));
 
             uint8_t idx[TURBO_BLOCK];
-            if (bits == 3) {
-                turbo_unpack_block3(blk_in + 2, blk_in + 10, idx);
-                for (int i = 0; i < TURBO_BLOCK; i++) {
-                    rot[b * TURBO_BLOCK + i] = turbo_cb3[idx[i]] * inv_scale;
-                }
-            } else {
-                turbo_unpack_block4(blk_in + 2, blk_in + 10, blk_in + 14, idx);
-                for (int i = 0; i < TURBO_BLOCK; i++) {
-                    rot[b * TURBO_BLOCK + i] = turbo_cb4[idx[i]] * inv_scale;
-                }
+            switch (bits) {
+                case 3:
+                    turbo_unpack_block3(blk_in + 2, blk_in + 10, idx);
+                    for (int i = 0; i < TURBO_BLOCK; i++) {
+                        rot[b * TURBO_BLOCK + i] = turbo_cb3[idx[i]] * inv_scale;
+                    }
+                    break;
+                case 4:
+                    turbo_unpack_block4(blk_in + 2, blk_in + 10, blk_in + 14, idx);
+                    for (int i = 0; i < TURBO_BLOCK; i++) {
+                        rot[b * TURBO_BLOCK + i] = turbo_cb4[idx[i]] * inv_scale;
+                    }
+                    break;
+                case 6:
+                    turbo_unpack_block6(blk_in + 2, idx);
+                    for (int i = 0; i < TURBO_BLOCK; i++) {
+                        rot[b * TURBO_BLOCK + i] = turbo_cb6[idx[i]] * inv_scale;
+                    }
+                    break;
+                default: /* 8 */
+                    turbo_unpack_block8(blk_in + 2, idx);
+                    for (int i = 0; i < TURBO_BLOCK; i++) {
+                        rot[b * TURBO_BLOCK + i] = turbo_cb8[idx[i]] * inv_scale;
+                    }
+                    break;
             }
         }
 
@@ -418,7 +635,9 @@ int ds4_turbo_self_test(void) {
     }
 
     int rc = 0;
-    for (int bits = 3; bits <= 4; bits++) {
+    static const int bit_widths[] = {3, 4, 6, 8};
+    for (size_t bi = 0; bi < sizeof(bit_widths) / sizeof(bit_widths[0]); bi++) {
+        const int bits = bit_widths[bi];
         const size_t row_bytes = ds4_turbo_row_bytes(head_dim, bits);
         uint8_t *enc = (uint8_t *)malloc(row_bytes * n_rows);
         if (!enc) { rc = 2; break; }
@@ -440,8 +659,15 @@ int ds4_turbo_self_test(void) {
         }
         const double cos_sim = dot / (sqrt(na) * sqrt(nb) + 1e-30);
         /* 3-bit Lloyd-Max sits at SNR ~14.6 dB so we accept >= 0.98;
-         * 4-bit gets to SNR ~20 dB and must clear 0.99. */
-        const double thr = (bits == 3) ? 0.98 : 0.99;
+         * 4-bit gets to SNR ~20 dB and must clear 0.99;
+         * 6-bit (SNR ~26 dB) clears 0.998; 8-bit (SNR ~32 dB) clears 0.9995. */
+        double thr;
+        switch (bits) {
+            case 3:  thr = 0.98;   break;
+            case 4:  thr = 0.99;   break;
+            case 6:  thr = 0.998;  break;
+            default: thr = 0.9995; break;
+        }
         if (!(cos_sim > thr)) {
             rc = 10 + bits;
             free(enc);
