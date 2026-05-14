@@ -292,6 +292,17 @@ int ds4_gpu_store_raw_kv_batch_tensor(
         uint32_t                n_tokens,
         uint32_t                head_dim);
 
+/* TurboQuant: encode `n_rows` fp32 attn-compressed rows from `src_fp32`
+ * (contiguous head_dim each) into the packed turbo storage `dst_turbo`
+ * at logical row `dst_row`. Only valid when ds4_turbo_kv_bits_get() != 0.
+ * head_dim must be 512. */
+int ds4_gpu_attn_comp_turbo_encode_rows(
+        ds4_gpu_tensor       *dst_turbo,
+        const ds4_gpu_tensor *src_fp32,
+        uint32_t                dst_row,
+        uint32_t                n_rows,
+        uint32_t                head_dim);
+
 /* =========================================================================
  * KV Compression and Attention.
  * =========================================================================

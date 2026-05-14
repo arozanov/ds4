@@ -6179,6 +6179,37 @@ static const float *kv_turbo_decode_rows(const void *storage, uint32_t n_rows) {
     return kv_turbo_decoded;
 }
 
+/* Compressed attn KV rows have the same 512-dim layout as the raw rows, so
+ * we reuse the same turbo encoding helpers and stride. The indexer
+ * compressed cache has 128-dim rows (DS4_N_INDEXER_HEAD_DIM) which the
+ * turbo encoder does not support, so it stays fp32 unconditionally. */
+static inline size_t kv_turbo_comp_row_bytes(void) {
+    return kv_turbo_row_bytes();
+}
+
+static void kv_turbo_encode_comp_row(const float *src, void *dst) {
+    kv_turbo_encode_row(src, dst);
+}
+
+static void kv_turbo_decode_comp_row(const void *src, float *dst) {
+    kv_turbo_decode_row(src, dst);
+}
+
+/* Decode every live attn_comp row into a heap buffer the caller frees.
+ * Returns NULL when n_rows == 0. The comp cache can be very large (up to
+ * ctx/ratio rows), so this is heap-allocated rather than a TLS buffer. */
+static float *kv_turbo_comp_decode_rows_heap(const void *storage, uint32_t n_rows) {
+    if (n_rows == 0) return NULL;
+    const size_t stride = kv_turbo_comp_row_bytes();
+    const uint8_t *bytes = (const uint8_t *)storage;
+    float *out = xmalloc((size_t)n_rows * DS4_N_HEAD_DIM * sizeof(float));
+    for (uint32_t r = 0; r < n_rows; r++) {
+        kv_turbo_decode_comp_row(bytes + (uint64_t)r * stride,
+                                 out + (uint64_t)r * DS4_N_HEAD_DIM);
+    }
+    return out;
+}
+
 static uint32_t ds4_default_raw_cap(uint32_t ctx_size) {
     uint32_t raw_cap = DS4_N_SWA;
     if (raw_cap > ctx_size) raw_cap = ctx_size;
@@ -6364,7 +6395,12 @@ static void kv_cache_init(ds4_kv_cache *cache, uint32_t ctx_size, uint32_t raw_c
             const uint32_t attn_rows = coff * ratio;
 
             cache->layer[il].comp_cap = comp_cap;
-            cache->layer[il].attn_comp_kv = xmalloc_zeroed((size_t)comp_cap * DS4_N_HEAD_DIM, sizeof(float));
+            if (ds4_turbo_kv_bits) {
+                const size_t comp_stride = kv_turbo_comp_row_bytes();
+                cache->layer[il].attn_comp_kv = (float *)xmalloc_zeroed((size_t)comp_cap * comp_stride, 1);
+            } else {
+                cache->layer[il].attn_comp_kv = xmalloc_zeroed((size_t)comp_cap * DS4_N_HEAD_DIM, sizeof(float));
+            }
             cache->layer[il].attn_state_kv = xmalloc_zeroed((size_t)attn_width * attn_rows, sizeof(float));
             cache->layer[il].attn_state_score = xmalloc((size_t)attn_width * attn_rows * sizeof(float));
             for (uint64_t i = 0; i < (uint64_t)attn_width * attn_rows; i++) {
@@ -6430,6 +6466,17 @@ static void kv_cache_push_raw(ds4_layer_cache *cache, const float *kv) {
 
 static void kv_cache_push_comp(float *rows, uint32_t *n_rows, uint32_t cap_rows, uint32_t row_dim, const float *kv) {
     if (*n_rows >= cap_rows) ds4_die("compressed KV cache capacity exceeded");
+    /* Turbo-encode attn comp rows (512-dim) into the packed cache layout.
+     * Indexer comp rows (128-dim) stay fp32 because the turbo encoder
+     * requires head_dim % 128 == 0 and uses a 128-wide rotation group --
+     * a 128-dim row would not benefit from rotation+quantization. */
+    if (ds4_turbo_kv_bits && row_dim == DS4_N_HEAD_DIM) {
+        const size_t stride = kv_turbo_comp_row_bytes();
+        uint8_t *base = (uint8_t *)rows;
+        kv_turbo_encode_comp_row(kv, base + (uint64_t)(*n_rows) * stride);
+        (*n_rows)++;
+        return;
+    }
     float *dst = rows + (uint64_t)(*n_rows) * row_dim;
     for (uint32_t i = 0; i < row_dim; i++) dst[i] = f16_to_f32(f32_to_f16(kv[i]));
     (*n_rows)++;
@@ -6731,9 +6778,15 @@ static void layer_attention_mixed_one(
         const bool        * comp_allowed) {
     const float *sinks = tensor_data(model, layer->attn_sinks);
     const float kq_scale = 1.0f / sqrtf((float)DS4_N_HEAD_DIM);
-    /* Diagnostic: turbo raw cache is bytes.  Compressed rows remain fp32. */
+    /* Diagnostic: turbo raw cache is bytes.  Decode raw and (optionally)
+     * compressed rows up front so the dot/axpy inner loop stays branchless. */
+    float *comp_decoded = NULL;
     if (ds4_turbo_kv_bits && n_raw > 0) {
         raw_kv = kv_turbo_decode_rows((const void *)raw_kv, n_raw);
+    }
+    if (ds4_turbo_kv_bits && n_comp > 0) {
+        comp_decoded = kv_turbo_comp_decode_rows_heap((const void *)comp_kv, n_comp);
+        comp_kv = comp_decoded;
     }
     const uint32_t n_total = n_raw + n_comp;
     float score_stack[512];
@@ -6783,6 +6836,7 @@ static void layer_attention_mixed_one(
     }
 
     if (score != score_stack) free(score);
+    free(comp_decoded);
 }
 
 static void layer_attention_mixed_one_decode_scratch(
@@ -6798,9 +6852,17 @@ static void layer_attention_mixed_one_decode_scratch(
         ds4_cpu_decode_scratch * scratch) {
     const float *sinks = tensor_data(model, layer->attn_sinks);
     const float kq_scale = 1.0f / sqrtf((float)DS4_N_HEAD_DIM);
-    /* Diagnostic: turbo raw cache is bytes; decode into thread-local scratch. */
+    /* Diagnostic: turbo raw cache is bytes; decode into thread-local scratch.
+     * Compressed rows can be larger than any pre-allocated decode scratch
+     * so we malloc them just for this call (CPU decode is already the slow
+     * reference path). */
+    float *comp_decoded = NULL;
     if (ds4_turbo_kv_bits && n_raw > 0) {
         raw_kv = kv_turbo_decode_rows((const void *)raw_kv, n_raw);
+    }
+    if (ds4_turbo_kv_bits && n_comp > 0) {
+        comp_decoded = kv_turbo_comp_decode_rows_heap((const void *)comp_kv, n_comp);
+        comp_kv = comp_decoded;
     }
     const uint32_t n_total = n_raw + n_comp;
     if (n_total > scratch->attn_score_cap) ds4_die("CPU decode attention score scratch buffer is too small");
@@ -6848,6 +6910,7 @@ static void layer_attention_mixed_one_decode_scratch(
         const float inv = 1.0f / denom;
         scale_f32(oh, inv, DS4_N_HEAD_DIM);
     }
+    free(comp_decoded);
 }
 
 typedef struct {
@@ -6952,6 +7015,7 @@ static void layer_attention_prefix_batch(
      * decode scratch.  Decode all live raw rows into a heap buffer up front
      * and hand workers the float view. */
     float *raw_decoded = NULL;
+    float *comp_decoded = NULL;
     if (ds4_turbo_kv_bits && raw_cap > 0) {
         raw_decoded = xmalloc((size_t)raw_cap * DS4_N_HEAD_DIM * sizeof(float));
         const size_t stride = kv_turbo_row_bytes();
@@ -6961,6 +7025,13 @@ static void layer_attention_prefix_batch(
                                 raw_decoded + (uint64_t)r * DS4_N_HEAD_DIM);
         }
         raw_kv = raw_decoded;
+    }
+    if (ds4_turbo_kv_bits && comp_counts && n_tok > 0) {
+        const uint32_t max_comp = comp_counts[n_tok - 1];
+        if (max_comp > 0) {
+            comp_decoded = kv_turbo_comp_decode_rows_heap((const void *)comp_kv, max_comp);
+            comp_kv = comp_decoded;
+        }
     }
     layer_attention_prefix_batch_ctx ctx = {
         .out_heads = out_heads,
@@ -6981,6 +7052,7 @@ static void layer_attention_prefix_batch(
                               &ctx,
                               1);
     free(raw_decoded);
+    free(comp_decoded);
 }
 
 /* Ratio-4 layers use an auxiliary indexer to select which compressed rows are
@@ -8246,6 +8318,15 @@ typedef struct {
     /* Per-layer work tensors.  They are reused in place by every layer instead
      * of allocating a generic graph arena.  This is why the code is verbose but
      * predictable: each pointer names an actual DS4 stage. */
+    /* TurboQuant attn comp KV: when DS4_TURBO_KV_BITS is set, the per-layer
+     * layer_attn_comp_cache is allocated as packed turbo bytes (per-row
+     * 352-672 B). The compressor pipeline kernels operate on fp32 rows, so
+     * we give them this shared fp32 scratch to write into, then encode
+     * the rows into the real turbo cache. Sized for the largest single
+     * write the pipeline performs: max(layer_comp_cap[il]) rows. NULL
+     * when turbo is off. */
+    ds4_gpu_tensor *attn_comp_scratch_fp32;
+    uint32_t attn_comp_scratch_cap;
     ds4_gpu_tensor *comp_kv_cur;
     ds4_gpu_tensor *comp_sc_cur;
     ds4_gpu_tensor *indexer_q;
@@ -8430,6 +8511,7 @@ static void metal_graph_free(ds4_gpu_graph *g) {
     ds4_gpu_tensor_free(g->heads);
     ds4_gpu_tensor_free(g->comp_sc_cur);
     ds4_gpu_tensor_free(g->comp_kv_cur);
+    ds4_gpu_tensor_free(g->attn_comp_scratch_fp32);
     ds4_gpu_tensor_free(g->comp_mask);
     ds4_gpu_tensor_free(g->comp_selected);
     ds4_gpu_tensor_free(g->indexer_scores);
@@ -8772,7 +8854,17 @@ static bool metal_graph_alloc_raw_cap(
             const uint32_t coff = ratio == 4 ? 2u : 1u;
             const uint64_t attn_width = (uint64_t)coff * DS4_N_HEAD_DIM;
             const uint64_t attn_rows = (uint64_t)coff * ratio;
-            g->layer_attn_comp_cache[il] = ds4_gpu_tensor_alloc((uint64_t)g->layer_comp_cap[il] * DS4_N_HEAD_DIM * sizeof(float));
+            {
+                /* TurboQuant: shrink the per-layer attn comp cache from
+                 * comp_cap*head_dim fp32 to comp_cap*turbo_row_bytes. The
+                 * indexer comp cache stays fp32 (128-dim is below the
+                 * 128-wide turbo rotation group). */
+                uint64_t attn_comp_bytes_per_row = (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
+                if (ds4_turbo_kv_bits) {
+                    attn_comp_bytes_per_row = (uint64_t)kv_turbo_row_bytes();
+                }
+                g->layer_attn_comp_cache[il] = ds4_gpu_tensor_alloc((uint64_t)g->layer_comp_cap[il] * attn_comp_bytes_per_row);
+            }
             g->layer_attn_state_kv[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
             g->layer_attn_state_score[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
             if (enable_mtp) {
@@ -8815,6 +8907,20 @@ static bool metal_graph_alloc_raw_cap(
     }
     g->comp_kv_cur = ds4_gpu_tensor_alloc(comp_width_max * sizeof(float));
     g->comp_sc_cur = ds4_gpu_tensor_alloc(comp_width_max * sizeof(float));
+    /* TurboQuant attn comp KV scratch: sized for the largest chunk the
+     * compressor pipeline can write in one call. Worst case is the
+     * zero-prefix prefill, which produces up to layer_comp_cap rows. */
+    g->attn_comp_scratch_cap = 0;
+    g->attn_comp_scratch_fp32 = NULL;
+    if (ds4_turbo_kv_bits) {
+        uint32_t scratch_rows = 1u;
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            if (g->layer_comp_cap[il] > scratch_rows) scratch_rows = g->layer_comp_cap[il];
+        }
+        g->attn_comp_scratch_cap = scratch_rows;
+        g->attn_comp_scratch_fp32 = ds4_gpu_tensor_alloc(
+                (uint64_t)scratch_rows * DS4_N_HEAD_DIM * sizeof(float));
+    }
     g->indexer_q = ds4_gpu_tensor_alloc(indexer_q_dim * sizeof(float));
     g->indexer_weights = ds4_gpu_tensor_alloc((uint64_t)DS4_N_INDEXER_HEAD * sizeof(float));
     g->indexer_scores = ds4_gpu_tensor_alloc((uint64_t)g->comp_cap * pc * sizeof(float));
@@ -8933,6 +9039,7 @@ static bool metal_graph_alloc_raw_cap(
     }
 
     const bool ok = state_init_ok && layer_cache_ok &&
+                    (!ds4_turbo_kv_bits || g->attn_comp_scratch_fp32) &&
                     g->cur_hc && g->flat_hc && g->hc_mix && g->hc_split &&
                     g->hc_pre && g->hc_post && g->hc_comb &&
                     g->attn_cur && g->attn_norm && g->qr && g->qr_norm &&
@@ -9416,11 +9523,19 @@ static bool metal_graph_encode_decode_layer(
                                                      g->attn_norm, 1) != 0;
         }
         const uint32_t comp_row = g->layer_n_comp[il];
+        /* TurboQuant: route the compressor pipeline through the fp32
+         * scratch (single row) and then encode into the packed cache. */
+        ds4_gpu_tensor *comp_write_target = g->layer_attn_comp_cache[il];
+        uint32_t comp_write_row = comp_row;
+        if (ds4_turbo_kv_bits) {
+            comp_write_target = g->attn_comp_scratch_fp32;
+            comp_write_row = 0u;
+        }
         if (ok) ok = ds4_gpu_compressor_update_tensor(g->comp_kv_cur,
                                                         g->comp_sc_cur,
                                                         g->layer_attn_state_kv[il],
                                                         g->layer_attn_state_score[il],
-                                                        g->layer_attn_comp_cache[il],
+                                                        comp_write_target,
                                                         model->map,
                                                         model->size,
                                                         layer->attn_compressor_ape->abs_offset,
@@ -9430,7 +9545,7 @@ static bool metal_graph_encode_decode_layer(
                                                         DS4_N_HEAD_DIM,
                                                         ratio,
                                                         pos,
-                                                        comp_row,
+                                                        comp_write_row,
                                                         DS4_N_ROT,
                                                         compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
                                                         freq_base,
@@ -9441,18 +9556,26 @@ static bool metal_graph_encode_decode_layer(
                                                         DS4_ROPE_YARN_BETA_SLOW,
                                                         DS4_RMS_EPS) != 0;
         if (ok && emit) {
-            ds4_gpu_tensor *comp_row_view = ds4_gpu_tensor_view(
-                    g->layer_attn_comp_cache[il],
-                    (uint64_t)comp_row * DS4_N_HEAD_DIM * sizeof(float),
-                    (uint64_t)DS4_N_HEAD_DIM * sizeof(float));
-            if (!comp_row_view) {
-                ok = false;
+            if (ds4_turbo_kv_bits) {
+                /* Encode the single produced row from scratch into the
+                 * packed turbo cache at the target row. */
+                ok = ds4_gpu_attn_comp_turbo_encode_rows(g->layer_attn_comp_cache[il],
+                                                          g->attn_comp_scratch_fp32,
+                                                          comp_row, 1, DS4_N_HEAD_DIM) != 0;
             } else {
-                ok = ds4_gpu_dsv4_fp8_kv_quantize_tensor(comp_row_view, 1, DS4_N_HEAD_DIM, DS4_N_ROT) != 0;
-                if (ok) {
-                    metal_graph_debug_dump_tensor("KVcompress", comp_row_view, DS4_N_HEAD_DIM, il, pos);
+                ds4_gpu_tensor *comp_row_view = ds4_gpu_tensor_view(
+                        g->layer_attn_comp_cache[il],
+                        (uint64_t)comp_row * DS4_N_HEAD_DIM * sizeof(float),
+                        (uint64_t)DS4_N_HEAD_DIM * sizeof(float));
+                if (!comp_row_view) {
+                    ok = false;
+                } else {
+                    ok = ds4_gpu_dsv4_fp8_kv_quantize_tensor(comp_row_view, 1, DS4_N_HEAD_DIM, DS4_N_ROT) != 0;
+                    if (ok) {
+                        metal_graph_debug_dump_tensor("KVcompress", comp_row_view, DS4_N_HEAD_DIM, il, pos);
+                    }
+                    ds4_gpu_tensor_free(comp_row_view);
                 }
-                ds4_gpu_tensor_free(comp_row_view);
             }
         }
         if (ok && emit) g->layer_n_comp[il]++;
@@ -11502,7 +11625,16 @@ static bool metal_graph_encode_layer_attention_batch(
                 ok = false;
             }
             if (ok) {
-                ok = ds4_gpu_compressor_prefill_tensor(g->layer_attn_comp_cache[il],
+                /* TurboQuant: route fp32 output through scratch and encode
+                 * into the packed cache. quantize_fp8 is disabled because
+                 * turbo encoding subsumes the fp8 round-trip on read. */
+                ds4_gpu_tensor *attn_prefill_target = g->layer_attn_comp_cache[il];
+                bool attn_prefill_quantize_fp8 = true;
+                if (ds4_turbo_kv_bits) {
+                    attn_prefill_target = g->attn_comp_scratch_fp32;
+                    attn_prefill_quantize_fp8 = false;
+                }
+                ok = ds4_gpu_compressor_prefill_tensor(attn_prefill_target,
                                                          g->layer_attn_state_kv[il],
                                                          g->layer_attn_state_score[il],
                                                          g->batch_comp_kv,
@@ -11519,7 +11651,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                          n_tokens,
                                                          DS4_N_ROT,
                                                          compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
-                                                         true,
+                                                         attn_prefill_quantize_fp8,
                                                          freq_base,
                                                          freq_scale,
                                                          ext_factor,
@@ -11527,6 +11659,11 @@ static bool metal_graph_encode_layer_attention_batch(
                                                          DS4_ROPE_YARN_BETA_FAST,
                                                          DS4_ROPE_YARN_BETA_SLOW,
                                                          DS4_RMS_EPS) != 0;
+                if (ok && ds4_turbo_kv_bits && n_comp > 0) {
+                    ok = ds4_gpu_attn_comp_turbo_encode_rows(g->layer_attn_comp_cache[il],
+                                                              g->attn_comp_scratch_fp32,
+                                                              0u, n_comp, DS4_N_HEAD_DIM) != 0;
+                }
                 if (ok && ratio == 4) {
                     ok = metal_graph_refresh_ratio4_compressor_state(g,
                                                                      model,
@@ -11546,7 +11683,7 @@ static bool metal_graph_encode_layer_attention_batch(
                 for (uint32_t t = 0; t < n_tokens; t++) {
                     comp_counts[t] = (pos0 + t + 1u) / ratio;
                 }
-                if (n_comp != 0) {
+                if (n_comp != 0 && !ds4_turbo_kv_bits) {
                     metal_graph_debug_dump_tensor("KVcompress",
                                                   g->layer_attn_comp_cache[il],
                                                   (uint64_t)n_comp * DS4_N_HEAD_DIM,
@@ -11573,11 +11710,22 @@ static bool metal_graph_encode_layer_attention_batch(
                     fprintf(stderr, "ds4: Metal graph compressed KV cache capacity exceeded at layer %u\n", il);
                     ok = false;
                 }
+                /* TurboQuant: when turbo is on the per-layer cache is
+                 * packed bytes -- redirect the pipeline write to the fp32
+                 * scratch's row-0 view, then encode into the cache slot. */
                 ds4_gpu_tensor *comp_view = NULL;
+                bool aligned_quantize_fp8 = true;
                 if (ok) {
-                    comp_view = ds4_gpu_tensor_view(g->layer_attn_comp_cache[il],
-                                                      (uint64_t)comp_before * DS4_N_HEAD_DIM * sizeof(float),
-                                                      (uint64_t)comp_chunk * DS4_N_HEAD_DIM * sizeof(float));
+                    if (ds4_turbo_kv_bits) {
+                        comp_view = ds4_gpu_tensor_view(g->attn_comp_scratch_fp32,
+                                                          0,
+                                                          (uint64_t)comp_chunk * DS4_N_HEAD_DIM * sizeof(float));
+                        aligned_quantize_fp8 = false;
+                    } else {
+                        comp_view = ds4_gpu_tensor_view(g->layer_attn_comp_cache[il],
+                                                          (uint64_t)comp_before * DS4_N_HEAD_DIM * sizeof(float),
+                                                          (uint64_t)comp_chunk * DS4_N_HEAD_DIM * sizeof(float));
+                    }
                     ok = comp_view != NULL;
                 }
                 if (ok && ratio == 4) {
@@ -11598,7 +11746,7 @@ static bool metal_graph_encode_layer_attention_batch(
                             n_tokens,
                             DS4_N_ROT,
                             compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
-                            true,
+                            aligned_quantize_fp8,
                             freq_base,
                             freq_scale,
                             ext_factor,
@@ -11625,7 +11773,7 @@ static bool metal_graph_encode_layer_attention_batch(
                             n_tokens,
                             DS4_N_ROT,
                             compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
-                            true,
+                            aligned_quantize_fp8,
                             freq_base,
                             freq_scale,
                             ext_factor,
@@ -11647,6 +11795,12 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                      pos0,
                                                                      n_tokens);
                 }
+                if (ok && ds4_turbo_kv_bits && comp_chunk > 0) {
+                    ok = ds4_gpu_attn_comp_turbo_encode_rows(g->layer_attn_comp_cache[il],
+                                                              g->attn_comp_scratch_fp32,
+                                                              comp_before, comp_chunk,
+                                                              DS4_N_HEAD_DIM) != 0;
+                }
                 if (ok) {
                     g->layer_n_comp[il] = comp_before + comp_chunk;
                     if (comp_counts) {
@@ -11654,11 +11808,13 @@ static bool metal_graph_encode_layer_attention_batch(
                             comp_counts[t] = (pos0 + t + 1u) / ratio;
                         }
                     }
-                    metal_graph_debug_dump_tensor("KVcompress",
-                                                  comp_view,
-                                                  (uint64_t)comp_chunk * DS4_N_HEAD_DIM,
-                                                  il,
-                                                  pos0);
+                    if (!ds4_turbo_kv_bits) {
+                        metal_graph_debug_dump_tensor("KVcompress",
+                                                      comp_view,
+                                                      (uint64_t)comp_chunk * DS4_N_HEAD_DIM,
+                                                      il,
+                                                      pos0);
+                    }
                     metal_graph_debug_dump_tensor("attn_state_kv",
                                                   g->layer_attn_state_kv[il],
                                                   (uint64_t)comp_width * coff * ratio,
@@ -11683,12 +11839,20 @@ static bool metal_graph_encode_layer_attention_batch(
                     ds4_gpu_tensor *kv_view = metal_graph_tensor_row_view(g->batch_comp_kv, t, comp_width);
                     ds4_gpu_tensor *sc_view = metal_graph_tensor_row_view(g->batch_comp_sc, t, comp_width);
                     const uint32_t comp_row = g->layer_n_comp[il];
+                    /* TurboQuant: substitute scratch row 0 for the write
+                     * target, encode after emit (mirrors decode path). */
+                    ds4_gpu_tensor *update_target = g->layer_attn_comp_cache[il];
+                    uint32_t update_row = comp_row;
+                    if (ds4_turbo_kv_bits) {
+                        update_target = g->attn_comp_scratch_fp32;
+                        update_row = 0u;
+                    }
                     ok = kv_view && sc_view &&
                          ds4_gpu_compressor_update_tensor(kv_view,
                                                             sc_view,
                                                             g->layer_attn_state_kv[il],
                                                             g->layer_attn_state_score[il],
-                                                            g->layer_attn_comp_cache[il],
+                                                            update_target,
                                                             model->map,
                                                             model->size,
                                                             layer->attn_compressor_ape->abs_offset,
@@ -11698,7 +11862,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                             DS4_N_HEAD_DIM,
                                                             ratio,
                                                             pos,
-                                                            comp_row,
+                                                            update_row,
                                                             DS4_N_ROT,
                                                             compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
                                                             freq_base,
@@ -11709,23 +11873,30 @@ static bool metal_graph_encode_layer_attention_batch(
                                                             DS4_ROPE_YARN_BETA_SLOW,
                                                             DS4_RMS_EPS) != 0;
                     if (ok && emit) {
-                        ds4_gpu_tensor *comp_row_view = ds4_gpu_tensor_view(
-                                g->layer_attn_comp_cache[il],
-                                (uint64_t)comp_row * DS4_N_HEAD_DIM * sizeof(float),
-                                (uint64_t)DS4_N_HEAD_DIM * sizeof(float));
-                        ok = comp_row_view &&
-                             ds4_gpu_dsv4_fp8_kv_quantize_tensor(comp_row_view,
-                                                                   1,
-                                                                   DS4_N_HEAD_DIM,
-                                                                   DS4_N_ROT) != 0;
-                        if (ok) {
-                            metal_graph_debug_dump_tensor("KVcompress",
-                                                          comp_row_view,
-                                                          DS4_N_HEAD_DIM,
-                                                          il,
-                                                          pos);
+                        if (ds4_turbo_kv_bits) {
+                            ok = ds4_gpu_attn_comp_turbo_encode_rows(g->layer_attn_comp_cache[il],
+                                                                      g->attn_comp_scratch_fp32,
+                                                                      comp_row, 1,
+                                                                      DS4_N_HEAD_DIM) != 0;
+                        } else {
+                            ds4_gpu_tensor *comp_row_view = ds4_gpu_tensor_view(
+                                    g->layer_attn_comp_cache[il],
+                                    (uint64_t)comp_row * DS4_N_HEAD_DIM * sizeof(float),
+                                    (uint64_t)DS4_N_HEAD_DIM * sizeof(float));
+                            ok = comp_row_view &&
+                                 ds4_gpu_dsv4_fp8_kv_quantize_tensor(comp_row_view,
+                                                                       1,
+                                                                       DS4_N_HEAD_DIM,
+                                                                       DS4_N_ROT) != 0;
+                            if (ok) {
+                                metal_graph_debug_dump_tensor("KVcompress",
+                                                              comp_row_view,
+                                                              DS4_N_HEAD_DIM,
+                                                              il,
+                                                              pos);
+                            }
+                            ds4_gpu_tensor_free(comp_row_view);
                         }
-                        ds4_gpu_tensor_free(comp_row_view);
                     }
                     if (ok && emit) g->layer_n_comp[il]++;
                     if (comp_counts) comp_counts[t] = g->layer_n_comp[il];
@@ -13962,13 +14133,14 @@ ds4_context_memory ds4_context_memory_estimate(ds4_backend backend, int ctx_size
                       m.raw_cap *
                       DS4_N_HEAD_DIM *
                       sizeof(float);
+        const uint64_t attn_comp_row_bytes = ds4_turbo_kv_bits
+            ? (uint64_t)kv_turbo_row_bytes()
+            : (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
         for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
             const uint32_t ratio = ds4_layer_compress_ratio(il);
             if (ratio == 0) continue;
             const uint32_t layer_comp_cap = ctx / ratio + 2u;
-            m.compressed_bytes += (uint64_t)layer_comp_cap *
-                                  DS4_N_HEAD_DIM *
-                                  sizeof(float);
+            m.compressed_bytes += (uint64_t)layer_comp_cap * attn_comp_row_bytes;
             if (ratio == 4) {
                 m.compressed_bytes += (uint64_t)layer_comp_cap *
                                       DS4_N_INDEXER_HEAD_DIM *
@@ -13985,14 +14157,15 @@ ds4_context_memory ds4_context_memory_estimate(ds4_backend backend, int ctx_size
                       m.raw_cap *
                       DS4_N_HEAD_DIM *
                       sizeof(float);
+        const uint64_t cpu_attn_comp_row_bytes = ds4_turbo_kv_bits
+            ? (uint64_t)kv_turbo_row_bytes()
+            : (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
         for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
             const uint32_t ratio = ds4_layer_compress_ratio(il);
             if (ratio == 0) continue;
             const uint32_t comp_cap = ctx / ratio + 2u;
             if (ratio == 4) m.comp_cap = comp_cap;
-            m.compressed_bytes += (uint64_t)comp_cap *
-                                  DS4_N_HEAD_DIM *
-                                  sizeof(float);
+            m.compressed_bytes += (uint64_t)comp_cap * cpu_attn_comp_row_bytes;
             if (ratio == 4) {
                 m.compressed_bytes += (uint64_t)comp_cap *
                                       DS4_N_INDEXER_HEAD_DIM *
@@ -14109,16 +14282,22 @@ static int metal_graph_prompt_logits_test(
 
                 const uint32_t n_comp = cpu_cache.layer[il].n_comp;
                 if (n_comp == 0) continue;
-                const uint64_t n = (uint64_t)n_comp * DS4_N_HEAD_DIM;
-                float *gpu_comp = xmalloc((size_t)n * sizeof(float));
-                if (ds4_gpu_tensor_read(g.layer_attn_comp_cache[il], 0, gpu_comp, n * sizeof(float)) != 0) {
-                    fprintf(stderr,
-                            "ds4: comp trace layer %u n=%u attn_max=%g attn_rms=%g\n",
-                            il, n_comp,
-                            max_abs_diff(cpu_cache.layer[il].attn_comp_kv, gpu_comp, n),
-                            rms_abs_diff(cpu_cache.layer[il].attn_comp_kv, gpu_comp, n));
+                /* Skip the GPU/CPU compare when turbo KV is enabled: both
+                 * caches are turbo-packed bytes, which max/rms diff would
+                 * misinterpret as fp32. The CPU path runs through the
+                 * decode-and-axpy reference reader anyway. */
+                if (!ds4_turbo_kv_bits) {
+                    const uint64_t n = (uint64_t)n_comp * DS4_N_HEAD_DIM;
+                    float *gpu_comp = xmalloc((size_t)n * sizeof(float));
+                    if (ds4_gpu_tensor_read(g.layer_attn_comp_cache[il], 0, gpu_comp, n * sizeof(float)) != 0) {
+                        fprintf(stderr,
+                                "ds4: comp trace layer %u n=%u attn_max=%g attn_rms=%g\n",
+                                il, n_comp,
+                                max_abs_diff(cpu_cache.layer[il].attn_comp_kv, gpu_comp, n),
+                                rms_abs_diff(cpu_cache.layer[il].attn_comp_kv, gpu_comp, n));
+                    }
+                    free(gpu_comp);
                 }
-                free(gpu_comp);
 
                 const uint32_t n_index = cpu_cache.layer[il].n_index_comp;
                 if (n_index != 0 && g.layer_index_comp_cache[il]) {
@@ -15689,8 +15868,14 @@ struct ds4_session {
  */
 
 #define DS4_SESSION_PAYLOAD_MAGIC UINT32_C(0x34565344) /* "DSV4" */
-#define DS4_SESSION_PAYLOAD_VERSION UINT32_C(1)
-#define DS4_SESSION_PAYLOAD_U32_FIELDS 13u
+/* Version 1: original fp32 raw-cache layout (header is 13 u32 fields).
+ * Version 2: adds a trailing turbo_bits u32 (0 = fp32, 3/4/6/8 = TurboQuant);
+ *            header is 14 u32 fields.  When turbo_bits != 0 the per-layer raw
+ *            cache body is `raw_live * kv_turbo_row_bytes()` opaque bytes
+ *            instead of `raw_live * DS4_N_HEAD_DIM * sizeof(float)`. */
+#define DS4_SESSION_PAYLOAD_VERSION UINT32_C(2)
+#define DS4_SESSION_PAYLOAD_U32_FIELDS 14u
+#define DS4_SESSION_PAYLOAD_U32_FIELDS_V1 13u
 #define DS4_SESSION_IO_CHUNK (8u * 1024u * 1024u)
 
 static void payload_set_err(char *err, size_t errlen, const char *msg) {
@@ -15796,11 +15981,17 @@ static uint32_t session_raw_live_rows(const ds4_gpu_graph *g, uint32_t checkpoin
 static uint64_t session_payload_live_tensor_bytes(const ds4_gpu_graph *g, uint32_t checkpoint_len) {
     uint64_t bytes = 0;
     const uint32_t raw_live = session_raw_live_rows(g, checkpoint_len);
+    /* When TurboQuant is on the attn comp cache rows are packed bytes,
+     * not fp32. Session save dumps the live row count in whichever
+     * layout the cache uses. */
+    const uint64_t attn_comp_row_bytes = ds4_turbo_kv_bits
+        ? (uint64_t)kv_turbo_row_bytes()
+        : (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         bytes += (uint64_t)raw_live * DS4_N_HEAD_DIM * sizeof(float);
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (ratio == 0) continue;
-        bytes += (uint64_t)g->layer_n_comp[il] * DS4_N_HEAD_DIM * sizeof(float);
+        bytes += (uint64_t)g->layer_n_comp[il] * attn_comp_row_bytes;
         bytes += layer_attn_state_bytes(ratio);
         bytes += layer_attn_state_bytes(ratio);
         if (ratio == 4) {
@@ -15888,9 +16079,14 @@ static uint32_t session_cpu_comp_cap(const ds4_session *s) {
 static uint64_t session_cpu_payload_live_tensor_bytes(const ds4_session *s) {
     uint64_t bytes = 0;
     const uint32_t raw_live = session_cpu_raw_live_rows(s);
+    /* When TurboQuant is active the raw cache holds opaque per-row bytes whose
+     * width is kv_turbo_row_bytes(); otherwise we still use fp32 floats. */
+    const uint64_t raw_row_bytes = ds4_turbo_kv_bits
+        ? (uint64_t)kv_turbo_row_bytes()
+        : (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         const ds4_layer_cache *layer = &s->cpu_cache.layer[il];
-        bytes += (uint64_t)raw_live * DS4_N_HEAD_DIM * sizeof(float);
+        bytes += (uint64_t)raw_live * raw_row_bytes;
         const uint32_t ratio = layer->compress_ratio;
         if (ratio == 0) continue;
         bytes += (uint64_t)layer->n_comp * DS4_N_HEAD_DIM * sizeof(float);
@@ -16067,16 +16263,17 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
         payload_set_err(err, errlen, "session has no valid checkpoint to save");
         return 1;
     }
-    /* Diagnostic: the turbo raw cache uses a row layout incompatible with the
-     * on-disk session format.  Refuse to serialize while the flag is set. */
-    if (ds4_turbo_kv_bits && ds4_session_is_cpu(s)) {
-        payload_set_err(err, errlen, "session payload not supported with DS4_TURBO_KV_BITS set");
-        return 1;
-    }
     if (ds4_session_is_cpu(s)) {
         const uint32_t raw_live = session_cpu_raw_live_rows(s);
         const uint32_t raw_cap = ds4_default_raw_cap((uint32_t)s->ctx_size);
         const uint32_t comp_cap = session_cpu_comp_cap(s);
+        const uint32_t turbo_bits = (uint32_t)ds4_turbo_kv_bits;
+        /* Raw rows are fp32 floats when turbo is off and opaque turbo bytes
+         * (kv_turbo_row_bytes()) when on.  layer->raw_kv is typed float* but in
+         * turbo mode we index it as uint8_t* with a per-row byte stride. */
+        const uint64_t raw_row_bytes = turbo_bits
+            ? (uint64_t)kv_turbo_row_bytes()
+            : (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
         uint32_t header[DS4_SESSION_PAYLOAD_U32_FIELDS] = {
             DS4_SESSION_PAYLOAD_MAGIC,
             DS4_SESSION_PAYLOAD_VERSION,
@@ -16091,6 +16288,7 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
             DS4_N_INDEXER_HEAD_DIM,
             DS4_N_VOCAB,
             raw_live,
+            turbo_bits,
         };
         for (uint32_t i = 0; i < DS4_SESSION_PAYLOAD_U32_FIELDS; i++) {
             if (payload_write_u32(fp, header[i], err, errlen) != 0) return 1;
@@ -16112,9 +16310,10 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
                 return 1;
             }
             const uint32_t raw_start = layer->n_raw - raw_live;
+            const uint8_t *raw_base = (const uint8_t *)layer->raw_kv;
             if (payload_write_bytes(fp,
-                                    layer->raw_kv + (uint64_t)raw_start * DS4_N_HEAD_DIM,
-                                    (uint64_t)raw_live * DS4_N_HEAD_DIM * sizeof(float),
+                                    raw_base + (uint64_t)raw_start * raw_row_bytes,
+                                    (uint64_t)raw_live * raw_row_bytes,
                                     err,
                                     errlen) != 0) return 1;
             const uint32_t ratio = layer->compress_ratio;
@@ -16155,6 +16354,9 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
      *   8 layers, 9 raw head dim, 10 indexer head dim, 11 vocab,
      *   12 live raw rows serialized below.
      */
+    /* The Metal raw cache always lives as fp32 on device, so turbo_bits stays 0
+     * for graph-backed sessions even when DS4_TURBO_KV_BITS is set for the CPU
+     * fallback. */
     uint32_t header[DS4_SESSION_PAYLOAD_U32_FIELDS] = {
         DS4_SESSION_PAYLOAD_MAGIC,
         DS4_SESSION_PAYLOAD_VERSION,
@@ -16169,6 +16371,7 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
         DS4_N_INDEXER_HEAD_DIM,
         DS4_N_VOCAB,
         raw_live,
+        0u,
     };
     for (uint32_t i = 0; i < DS4_SESSION_PAYLOAD_U32_FIELDS; i++) {
         if (payload_write_u32(fp, header[i], err, errlen) != 0) return 1;
@@ -16206,15 +16409,22 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
         if (rc != 0 || ratio == 0) continue;
         /* Compressed rows are append-only from row zero, so the live prefix is
          * contiguous.  The two compressor state tensors hold the partial window
-         * that will become the next compressed row. */
-        rc = payload_write_tensor_span(fp,
-                                       g->layer_attn_comp_cache[il],
-                                       0,
-                                       (uint64_t)g->layer_n_comp[il] * DS4_N_HEAD_DIM * sizeof(float),
-                                       buf,
-                                       DS4_SESSION_IO_CHUNK,
-                                       err,
-                                       errlen);
+         * that will become the next compressed row. When TurboQuant is on
+         * the rows are packed bytes (saves space; restore must run with
+         * matching DS4_TURBO_KV_BITS, which the header check enforces). */
+        {
+            const uint64_t attn_comp_row_bytes_save = ds4_turbo_kv_bits
+                ? (uint64_t)kv_turbo_row_bytes()
+                : (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
+            rc = payload_write_tensor_span(fp,
+                                           g->layer_attn_comp_cache[il],
+                                           0,
+                                           (uint64_t)g->layer_n_comp[il] * attn_comp_row_bytes_save,
+                                           buf,
+                                           DS4_SESSION_IO_CHUNK,
+                                           err,
+                                           errlen);
+        }
         if (rc == 0) rc = payload_write_tensor_span(fp,
                                                     g->layer_attn_state_kv[il],
                                                     0,
@@ -16268,20 +16478,28 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
         payload_set_err(err, errlen, "invalid session payload load");
         return 1;
     }
-    /* Diagnostic: see ds4_session_save_payload. */
-    if (ds4_turbo_kv_bits && ds4_session_is_cpu(s)) {
-        payload_set_err(err, errlen, "session payload not supported with DS4_TURBO_KV_BITS set");
-        return 1;
-    }
     uint64_t remaining = payload_bytes;
-    uint32_t h[DS4_SESSION_PAYLOAD_U32_FIELDS];
-    for (uint32_t i = 0; i < DS4_SESSION_PAYLOAD_U32_FIELDS; i++) {
-        if (payload_read_u32(fp, &h[i], &remaining, err, errlen) != 0) return 1;
-    }
-    if (h[0] != DS4_SESSION_PAYLOAD_MAGIC || h[1] != DS4_SESSION_PAYLOAD_VERSION) {
+    /* The header layout depends on the version: v1 had 13 u32 fields, v2 adds a
+     * trailing turbo_bits field.  Read magic+version first so we know how many
+     * extra header words to expect, then zero-fill the missing tail. */
+    uint32_t h[DS4_SESSION_PAYLOAD_U32_FIELDS] = {0};
+    if (payload_read_u32(fp, &h[0], &remaining, err, errlen) != 0) return 1;
+    if (payload_read_u32(fp, &h[1], &remaining, err, errlen) != 0) return 1;
+    if (h[0] != DS4_SESSION_PAYLOAD_MAGIC ||
+        (h[1] != DS4_SESSION_PAYLOAD_VERSION && h[1] != UINT32_C(1)))
+    {
         payload_set_err(err, errlen, "unsupported session payload version");
         return 1;
     }
+    const uint32_t header_words = (h[1] == UINT32_C(1))
+        ? DS4_SESSION_PAYLOAD_U32_FIELDS_V1
+        : DS4_SESSION_PAYLOAD_U32_FIELDS;
+    for (uint32_t i = 2; i < header_words; i++) {
+        if (payload_read_u32(fp, &h[i], &remaining, err, errlen) != 0) return 1;
+    }
+    /* h[13] is turbo_bits in v2; v1 implicitly means 0 (fp32 raw cache). */
+    const uint32_t saved_turbo_bits = (header_words >= DS4_SESSION_PAYLOAD_U32_FIELDS)
+        ? h[13] : 0u;
     if (ds4_session_is_cpu(s)) {
         const uint32_t saved_ctx = h[2];
         const uint32_t saved_prefill_cap = h[3];
@@ -16292,6 +16510,17 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
         const uint32_t saved_raw_live = h[12];
         const uint32_t cpu_raw_cap = ds4_default_raw_cap((uint32_t)s->ctx_size);
         const uint32_t cpu_comp_cap = session_cpu_comp_cap(s);
+        /* Raw cache layout must match exactly: a vanilla save cannot be loaded
+         * into a turbo runtime (the byte strides differ), and two turbo files
+         * with different bit widths are also incompatible. */
+        if (saved_turbo_bits != (uint32_t)ds4_turbo_kv_bits) {
+            payload_set_err(err, errlen,
+                "KV checkpoint turbo bits do not match current DS4_TURBO_KV_BITS");
+            return 1;
+        }
+        const uint64_t raw_row_bytes = ds4_turbo_kv_bits
+            ? (uint64_t)kv_turbo_row_bytes()
+            : (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
         if (saved_ctx > (uint32_t)s->ctx_size || saved_tokens >= (uint32_t)s->ctx_size) {
             payload_set_err(err, errlen, "KV checkpoint does not fit current context");
             return 1;
@@ -16363,9 +16592,12 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
         session_cpu_reset_cache(s);
         for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
             ds4_layer_cache *layer = &s->cpu_cache.layer[il];
+            /* In turbo mode raw_kv is opaque per-row bytes (kv_turbo_row_bytes()
+             * wide); in vanilla mode it's fp32 floats.  The reset above zeroed
+             * the rest of the ring so writes beyond `saved_raw_live` are safe. */
             if (payload_read_bytes(fp,
                                    layer->raw_kv,
-                                   (uint64_t)saved_raw_live * DS4_N_HEAD_DIM * sizeof(float),
+                                   (uint64_t)saved_raw_live * raw_row_bytes,
                                    &remaining,
                                    err,
                                    errlen) != 0)
@@ -16428,6 +16660,13 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
     const uint32_t saved_comp_cap = h[6];
     const uint32_t saved_tokens = h[7];
     const uint32_t saved_raw_live = h[12];
+    /* The Metal raw cache is always fp32, so turbo-encoded files cannot be
+     * loaded into a graph-backed session. */
+    if (saved_turbo_bits != 0u) {
+        payload_set_err(err, errlen,
+            "turbo-encoded KV checkpoint cannot be loaded into a graph session");
+        return 1;
+    }
     if (saved_ctx > (uint32_t)s->ctx_size || saved_tokens >= (uint32_t)s->ctx_size) {
         payload_set_err(err, errlen, "KV checkpoint does not fit current context");
         return 1;
@@ -16519,15 +16758,20 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
         }
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (rc != 0 || ratio == 0) continue;
-        rc = payload_read_tensor_span(fp,
-                                      g->layer_attn_comp_cache[il],
-                                      0,
-                                      (uint64_t)n_comp[il] * DS4_N_HEAD_DIM * sizeof(float),
-                                      buf,
-                                      DS4_SESSION_IO_CHUNK,
-                                      &remaining,
-                                      err,
-                                      errlen);
+        {
+            const uint64_t attn_comp_row_bytes_load = ds4_turbo_kv_bits
+                ? (uint64_t)kv_turbo_row_bytes()
+                : (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
+            rc = payload_read_tensor_span(fp,
+                                          g->layer_attn_comp_cache[il],
+                                          0,
+                                          (uint64_t)n_comp[il] * attn_comp_row_bytes_load,
+                                          buf,
+                                          DS4_SESSION_IO_CHUNK,
+                                          &remaining,
+                                          err,
+                                          errlen);
+        }
         if (rc == 0) rc = payload_read_tensor_span(fp,
                                                    g->layer_attn_state_kv[il],
                                                    0,

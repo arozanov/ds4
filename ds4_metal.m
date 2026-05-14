@@ -6674,6 +6674,126 @@ static int ds4_gpu_encode_turbo_dequant_to_kv_scratch(
                                                   head, bits);
 }
 
+/* TurboQuant attn compressed-KV path.
+ *
+ * Unlike the raw SWA cache, the compressed cache is contiguous (no ring
+ * rotation): we always read rows [0, n_comp). The compressor pipeline
+ * needs fp32 rows for softmax-pool / rms-norm / RoPE, so callers in ds4.c
+ * stage the new rows in g->attn_comp_scratch_fp32 and then ask us to
+ * encode the produced chunk into the turbo cache at the right row offset.
+ *
+ * Reads dequant into the same g_flash_attn_kv_buffer fp16 scratch the
+ * raw helper uses. Each turbo row writes head_dim halves (1024 B). */
+
+/* Encode `n_rows` fp32 rows (head_dim each) from `src_fp32` into the
+ * packed turbo storage `dst_turbo` starting at logical row `dst_row`.
+ * Mirrors the layout in ds4.c: turbo block followed by fp16 RoPE tail. */
+int ds4_gpu_attn_comp_turbo_encode_rows(
+        ds4_gpu_tensor       *dst_turbo,
+        const ds4_gpu_tensor *src_fp32,
+        uint32_t                dst_row,
+        uint32_t                n_rows,
+        uint32_t                head_dim) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!dst_turbo || !src_fp32 || head_dim != 512 || n_rows == 0) return 0;
+
+    const int bits = ds4_gpu_turbo_bits_active();
+    if (!bits) {
+        fprintf(stderr, "ds4: attn comp turbo encode called with no active turbo bits\n");
+        return 0;
+    }
+    DS4_TURBO_TRACE("attn_comp_encode dst_row=%u n_rows=%u head_dim=%u bits=%d",
+                    dst_row, n_rows, head_dim, bits);
+
+    @autoreleasepool {
+        const size_t row_bytes = ds4_gpu_turbo_row_bytes_512(bits);
+        if (row_bytes == 0) return 0;
+        const uint64_t src_bytes = (uint64_t)n_rows * head_dim * sizeof(float);
+        const uint64_t dst_need = ((uint64_t)dst_row + n_rows) * row_bytes;
+        id<MTLBuffer> srcbuf = ds4_gpu_tensor_buffer(src_fp32);
+        id<MTLBuffer> dstbuf = ds4_gpu_tensor_buffer(dst_turbo);
+        if (!srcbuf || !dstbuf ||
+            ds4_gpu_tensor_bytes(src_fp32) < src_bytes ||
+            ds4_gpu_tensor_bytes(dst_turbo) < dst_need) {
+            fprintf(stderr, "ds4: attn comp turbo encode received undersized buffers\n");
+            return 0;
+        }
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+
+        const NSUInteger src_off0 = ds4_gpu_tensor_offset(src_fp32);
+        const NSUInteger dst_off0 = ds4_gpu_tensor_offset(dst_turbo) +
+                                    (NSUInteger)dst_row * (NSUInteger)row_bytes;
+        ds4_gpu_ds4_turbo_args base_args = {
+            .head_dim = 512,
+            .bits = bits,
+            .n_rows = 1,
+            .pad = 0,
+            .row_bytes_in = 0,
+            .row_bytes_out = 0,
+        };
+
+        /* The turbo quantize kernel dispatches per-row, same as the raw
+         * batch store path. Loop here because the destination stride
+         * (row_bytes) differs from the contiguous fp32 source stride. */
+        for (uint32_t t = 0; t < n_rows; t++) {
+            const NSUInteger src_off = src_off0 + (NSUInteger)t * (NSUInteger)head_dim * sizeof(float);
+            const NSUInteger dst_off = dst_off0 + (NSUInteger)t * (NSUInteger)row_bytes;
+            id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+            [enc setComputePipelineState:g_ds4_turbo_quantize_row_pipeline];
+            [enc setBytes:&base_args length:sizeof(base_args) atIndex:0];
+            [enc setBuffer:srcbuf offset:src_off atIndex:1];
+            [enc setBuffer:dstbuf offset:dst_off atIndex:2];
+            [enc setThreadgroupMemoryLength:128u * sizeof(float) atIndex:0];
+            [enc setThreadgroupMemoryLength:672u * sizeof(float) atIndex:1];
+            [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            ds4_gpu_end_compute_encoder(cb, enc);
+
+            if (!ds4_gpu_turbo_encode_rope_tail_batch(cb,
+                                                        srcbuf, src_off,
+                                                        dstbuf, dst_off,
+                                                        1, bits)) {
+                return 0;
+            }
+        }
+
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "attn comp turbo encode")) return 0;
+    }
+
+    return 1;
+}
+
+/* Dequant `n_rows` turbo-encoded rows from `src_turbo` (starting at row 0)
+ * into `dst_fp16` at `dst_offset`. Used by attention readers to materialize
+ * the comp cache as fp16 before flash-attention consumes it. */
+static int ds4_gpu_encode_attn_comp_turbo_dequant_to_fp16(
+        id<MTLCommandBuffer>  cb,
+        const ds4_gpu_tensor *src_turbo,
+        id<MTLBuffer>         dst_fp16,
+        NSUInteger            dst_offset,
+        uint32_t              n_rows,
+        int                   bits) {
+    if (!cb || !src_turbo || !dst_fp16 || n_rows == 0 || !bits) return 0;
+    id<MTLBuffer> srcbuf = ds4_gpu_tensor_buffer(src_turbo);
+    if (!srcbuf) return 0;
+    const size_t row_bytes = ds4_gpu_turbo_row_bytes_512(bits);
+    if (row_bytes == 0) return 0;
+    const NSUInteger src_off = ds4_gpu_tensor_offset(src_turbo);
+    DS4_TURBO_TRACE("attn_comp_dequant n_rows=%u bits=%d row_bytes=%zu",
+                    n_rows, bits, row_bytes);
+    return ds4_gpu_turbo_dequantize_batch(cb,
+                                            srcbuf, src_off,
+                                            dst_fp16, dst_offset,
+                                            n_rows, bits) &&
+           ds4_gpu_turbo_decode_rope_tail_batch(cb,
+                                                  srcbuf, src_off,
+                                                  dst_fp16, dst_offset,
+                                                  n_rows, bits);
+}
+
 static int ds4_gpu_encode_compressor_score_with_ape(
         id<MTLCommandBuffer> cb,
         id<MTLBuffer>        score_src,
@@ -9424,9 +9544,13 @@ static int ds4_gpu_encode_flash_attention_prefill_static_mixed_heads_nonvec_long
     id<MTLBuffer> compbuf = n_comp ? ds4_gpu_tensor_buffer(comp_kv) : rawbuf;
     id<MTLBuffer> maskbuf = use_comp_mask ? ds4_gpu_tensor_buffer(comp_mask) : rawbuf;
     id<MTLBuffer> headsbuf = ds4_gpu_tensor_buffer(heads);
+    const int turbo_bits_psm_long = ds4_gpu_turbo_bits_active();
     const uint64_t q_bytes = (uint64_t)n_tokens * n_head * head_dim * sizeof(float);
     const uint64_t raw_bytes = (uint64_t)n_tokens * head_dim * sizeof(float);
-    const uint64_t comp_bytes = (uint64_t)n_comp * head_dim * sizeof(float);
+    const uint64_t comp_row_bytes_long = turbo_bits_psm_long ?
+        (uint64_t)ds4_gpu_turbo_row_bytes_512(turbo_bits_psm_long) :
+        (uint64_t)head_dim * sizeof(float);
+    const uint64_t comp_bytes = (uint64_t)n_comp * comp_row_bytes_long;
     const uint64_t comp_mask_bytes = use_comp_mask ? (uint64_t)n_comp * n_tokens * sizeof(float) : 0u;
     if (!qbuf || !rawbuf || !compbuf || !maskbuf || !headsbuf || !sinks_buf ||
         ds4_gpu_tensor_bytes(q) < q_bytes ||
@@ -9485,14 +9609,24 @@ static int ds4_gpu_encode_flash_attention_prefill_static_mixed_heads_nonvec_long
                                          n_tokens * head_dim)) {
         return 0;
     }
-    if (n_comp &&
-        !ds4_gpu_encode_cpy_f32_f16_1d(cb,
-                                         compbuf,
-                                         ds4_gpu_tensor_offset(comp_kv),
-                                         g_flash_attn_kv_buffer,
-                                         (NSUInteger)n_tokens * row_bytes_f16,
-                                         n_comp * head_dim)) {
-        return 0;
+    if (n_comp) {
+        if (turbo_bits_psm_long) {
+            if (!ds4_gpu_encode_attn_comp_turbo_dequant_to_fp16(cb,
+                                                                  comp_kv,
+                                                                  g_flash_attn_kv_buffer,
+                                                                  (NSUInteger)n_tokens * row_bytes_f16,
+                                                                  n_comp,
+                                                                  turbo_bits_psm_long)) {
+                return 0;
+            }
+        } else if (!ds4_gpu_encode_cpy_f32_f16_1d(cb,
+                                                    compbuf,
+                                                    ds4_gpu_tensor_offset(comp_kv),
+                                                    g_flash_attn_kv_buffer,
+                                                    (NSUInteger)n_tokens * row_bytes_f16,
+                                                    n_comp * head_dim)) {
+            return 0;
+        }
     }
 
     ds4_gpu_fill_static_mixed_prefill_mask((uint16_t *)[mask_buffer contents],
@@ -9665,9 +9799,13 @@ static int ds4_gpu_encode_flash_attention_prefill_static_mixed_heads_vec(
     id<MTLBuffer> compbuf = n_comp ? ds4_gpu_tensor_buffer(comp_kv) : rawbuf;
     id<MTLBuffer> maskbuf = use_comp_mask ? ds4_gpu_tensor_buffer(comp_mask) : rawbuf;
     id<MTLBuffer> headsbuf = ds4_gpu_tensor_buffer(heads);
+    const int turbo_bits_psm_vec = ds4_gpu_turbo_bits_active();
     const uint64_t q_bytes = (uint64_t)n_tokens * n_head * head_dim * sizeof(float);
     const uint64_t raw_bytes = (uint64_t)n_tokens * head_dim * sizeof(float);
-    const uint64_t comp_bytes = (uint64_t)n_comp * head_dim * sizeof(float);
+    const uint64_t comp_row_bytes_vec = turbo_bits_psm_vec ?
+        (uint64_t)ds4_gpu_turbo_row_bytes_512(turbo_bits_psm_vec) :
+        (uint64_t)head_dim * sizeof(float);
+    const uint64_t comp_bytes = (uint64_t)n_comp * comp_row_bytes_vec;
     const uint64_t comp_mask_bytes = use_comp_mask ? (uint64_t)n_comp * n_tokens * sizeof(float) : 0u;
     if (!qbuf || !rawbuf || !compbuf || !maskbuf || !headsbuf || !sinks_buf ||
         ds4_gpu_tensor_bytes(q) < q_bytes ||
@@ -9724,12 +9862,21 @@ static int ds4_gpu_encode_flash_attention_prefill_static_mixed_heads_vec(
         return 0;
     }
     if (n_comp) {
-        if (!ds4_gpu_encode_cpy_f32_f16_1d(cb,
-                                             compbuf,
-                                             ds4_gpu_tensor_offset(comp_kv),
-                                             g_flash_attn_kv_buffer,
-                                             (NSUInteger)n_tokens * row_bytes_f16,
-                                             n_comp * head_dim)) {
+        if (turbo_bits_psm_vec) {
+            if (!ds4_gpu_encode_attn_comp_turbo_dequant_to_fp16(cb,
+                                                                  comp_kv,
+                                                                  g_flash_attn_kv_buffer,
+                                                                  (NSUInteger)n_tokens * row_bytes_f16,
+                                                                  n_comp,
+                                                                  turbo_bits_psm_vec)) {
+                return 0;
+            }
+        } else if (!ds4_gpu_encode_cpy_f32_f16_1d(cb,
+                                                    compbuf,
+                                                    ds4_gpu_tensor_offset(comp_kv),
+                                                    g_flash_attn_kv_buffer,
+                                                    (NSUInteger)n_tokens * row_bytes_f16,
+                                                    n_comp * head_dim)) {
             return 0;
         }
     }
@@ -10348,9 +10495,13 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
     id<MTLBuffer> compbuf = n_comp ? ds4_gpu_tensor_buffer(comp_kv) : nil;
     id<MTLBuffer> headsbuf = ds4_gpu_tensor_buffer(heads);
     id<MTLBuffer> maskbuf = use_mask ? ds4_gpu_tensor_buffer(comp_mask) : nil;
+    const int turbo_bits_gathered = ds4_gpu_turbo_bits_active();
     const uint64_t q_bytes = (uint64_t)n_head * head_dim * sizeof(float);
     const uint64_t raw_bytes = (uint64_t)raw_cap * head_dim * sizeof(float);
-    const uint64_t comp_bytes = (uint64_t)n_comp * head_dim * sizeof(float);
+    const uint64_t comp_row_bytes_gathered = turbo_bits_gathered ?
+        (uint64_t)ds4_gpu_turbo_row_bytes_512(turbo_bits_gathered) :
+        (uint64_t)head_dim * sizeof(float);
+    const uint64_t comp_bytes = (uint64_t)n_comp * comp_row_bytes_gathered;
     const uint64_t comp_mask_bytes = use_mask ? (uint64_t)n_comp * sizeof(float) : 0u;
     if (!qbuf || !rawbuf || !headsbuf || !sinks_buf ||
         (n_comp && !compbuf) ||
@@ -10469,12 +10620,21 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
         }
     }
     if (n_comp) {
-        if (!ds4_gpu_encode_cpy_f32_f16_1d(cb,
-                                             compbuf,
-                                             ds4_gpu_tensor_offset(comp_kv),
-                                             g_flash_attn_kv_buffer,
-                                             (NSUInteger)n_raw * row_bytes_f16,
-                                             n_comp * head_dim)) {
+        if (turbo_bits_gathered) {
+            if (!ds4_gpu_encode_attn_comp_turbo_dequant_to_fp16(cb,
+                                                                  comp_kv,
+                                                                  g_flash_attn_kv_buffer,
+                                                                  (NSUInteger)n_raw * row_bytes_f16,
+                                                                  n_comp,
+                                                                  turbo_bits_gathered)) {
+                return 0;
+            }
+        } else if (!ds4_gpu_encode_cpy_f32_f16_1d(cb,
+                                                    compbuf,
+                                                    ds4_gpu_tensor_offset(comp_kv),
+                                                    g_flash_attn_kv_buffer,
+                                                    (NSUInteger)n_raw * row_bytes_f16,
+                                                    n_comp * head_dim)) {
             return 0;
         }
     }
@@ -10903,7 +11063,13 @@ static int ds4_gpu_encode_flash_attention_decode_mixed_batch_heads(
     id<MTLBuffer> headsbuf = ds4_gpu_tensor_buffer(heads);
     const uint64_t q_bytes = (uint64_t)n_tokens * n_head * head_dim * sizeof(float);
     const uint64_t raw_bytes = (uint64_t)raw_cap * head_dim * sizeof(float);
-    const uint64_t comp_bytes = (uint64_t)n_comp * head_dim * sizeof(float);
+    /* When TurboQuant is on the comp_kv buffer is packed bytes (smaller).
+     * The dequant path needs only `n_comp * turbo_row_bytes`. */
+    const int turbo_bits_dmb_check = ds4_gpu_turbo_bits_active();
+    const uint64_t comp_row_bytes_decode = turbo_bits_dmb_check ?
+        (uint64_t)ds4_gpu_turbo_row_bytes_512(turbo_bits_dmb_check) :
+        (uint64_t)head_dim * sizeof(float);
+    const uint64_t comp_bytes = (uint64_t)n_comp * comp_row_bytes_decode;
     const uint64_t comp_mask_bytes = use_comp_mask ? (uint64_t)n_comp * n_tokens * sizeof(float) : 0u;
     if (!qbuf || !rawbuf || !compbuf || !maskbuf || !headsbuf || !sinks_buf ||
         ds4_gpu_tensor_bytes(q) < q_bytes ||
@@ -11006,13 +11172,27 @@ static int ds4_gpu_encode_flash_attention_decode_mixed_batch_heads(
             }
         }
     }
-    if (!ds4_gpu_encode_cpy_f32_f16_1d(cb,
-                                         compbuf,
-                                         ds4_gpu_tensor_offset(comp_kv),
-                                         g_flash_attn_kv_buffer,
-                                         (NSUInteger)n_raw * row_bytes_f16,
-                                         n_comp * head_dim)) {
-        return 0;
+    {
+        const int turbo_bits_comp = ds4_gpu_turbo_bits_active();
+        if (turbo_bits_comp) {
+            if (!ds4_gpu_encode_attn_comp_turbo_dequant_to_fp16(cb,
+                                                                  comp_kv,
+                                                                  g_flash_attn_kv_buffer,
+                                                                  (NSUInteger)n_raw * row_bytes_f16,
+                                                                  n_comp,
+                                                                  turbo_bits_comp)) {
+                return 0;
+            }
+        } else {
+            if (!ds4_gpu_encode_cpy_f32_f16_1d(cb,
+                                                 compbuf,
+                                                 ds4_gpu_tensor_offset(comp_kv),
+                                                 g_flash_attn_kv_buffer,
+                                                 (NSUInteger)n_raw * row_bytes_f16,
+                                                 n_comp * head_dim)) {
+                return 0;
+            }
+        }
     }
 
     ds4_gpu_fill_mixed_decode_batch_mask((uint16_t *)[mask_buffer contents],
@@ -11691,9 +11871,13 @@ int ds4_gpu_attention_decode_heads_tensor(
     }
 
     @autoreleasepool {
+        const int turbo_bits_ah = ds4_gpu_turbo_bits_active();
         const uint64_t q_bytes = (uint64_t)n_head * head_dim * sizeof(float);
         const uint64_t raw_bytes = (uint64_t)raw_cap * head_dim * sizeof(float);
-        const uint64_t comp_bytes = (uint64_t)n_comp * head_dim * sizeof(float);
+        const uint64_t comp_row_bytes_ah = turbo_bits_ah ?
+            (uint64_t)ds4_gpu_turbo_row_bytes_512(turbo_bits_ah) :
+            (uint64_t)head_dim * sizeof(float);
+        const uint64_t comp_bytes = (uint64_t)n_comp * comp_row_bytes_ah;
         const uint64_t sink_bytes = (uint64_t)n_head * sizeof(float);
         if (sinks_offset > model_size || sink_bytes > model_size - sinks_offset) {
             fprintf(stderr, "ds4: Metal graph attention heads sink range is outside the mapped model\n");
