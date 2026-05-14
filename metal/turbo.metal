@@ -387,6 +387,89 @@ kernel void kernel_ds4_turbo_dequantize_batch(
     }
 }
 
+// KV-cache RoPE tail glue.
+//
+// The CPU TurboQuant KV layout stores the last n_rot dims of each
+// 512-float row as raw fp16 to preserve the rotary positional
+// encoding bit-for-bit: turbo cannot be trusted to round-trip the
+// trigonometric tail with enough fidelity for attention to locate
+// tokens. The GPU mirrors this layout: each cache row is
+//   [ turbo_bytes(512) | n_rot * fp16 RoPE tail ]
+// where the turbo block still encodes all 512 dims (so the rotation
+// groups are aligned to 128-dim boundaries), and the fp16 tail
+// overlays the last n_rot dims on read.
+//
+// Encode tail: lanes 0..n_rot-1 read the last n_rot fp32 source
+// values and store them as fp16 at the row's tail slot.
+//
+// args.head_dim   = 512
+// args.bits       = 3 or 4 (selects the turbo prefix size)
+// args.n_rot      = number of RoPE dims (passed via args.pad)
+// args.row_bytes_in  = full row stride in dst (turbo + tail)
+// args.row_bytes_out = source fp32 row stride in bytes
+//
+// Source layout: tightly packed `n_rows * head_dim` floats.
+// Dst layout:    `n_rows * row_bytes_in` bytes; each row's tail
+//                lives at byte offset (row_bytes_in - n_rot*2).
+kernel void kernel_ds4_turbo_kv_rope_tail_encode(
+        constant ds4_metal_args_turbo & args,
+        device const float            * src,
+        device       uchar            * dst,
+        uint  row [[threadgroup_position_in_grid]],
+        ushort tid [[thread_position_in_threadgroup]]) {
+    if ((int)row >= args.n_rows) return;
+    const int head_dim = args.head_dim;
+    const int n_rot    = args.pad;       // reuse the pad slot for n_rot
+    if (head_dim <= 0 || n_rot <= 0 || n_rot > head_dim) return;
+    if ((int)tid >= n_rot) return;
+
+    const uint src_stride = (uint)(args.row_bytes_out / sizeof(float));
+    const uint dst_stride = (uint)args.row_bytes_in;
+    const uint tail_off   = dst_stride - (uint)n_rot * (uint)sizeof(half);
+
+    const uint nope = (uint)(head_dim - n_rot);
+    const float v = src[(uint)row * src_stride + nope + (uint)tid];
+    const ushort h = turbo_f32_to_f16_bits(v);
+
+    device uchar * tail = dst + (uint)row * dst_stride + tail_off;
+    tail[(uint)tid * 2 + 0] = (uchar)(h & 0xff);
+    tail[(uint)tid * 2 + 1] = (uchar)((h >> 8) & 0xff);
+}
+
+// Decode tail: overwrite the last n_rot halves of each decoded row
+// in `dst` with the fp16 tail bytes from `src`. Runs after the
+// turbo dequant kernel has populated the full 512-half row; the
+// turbo-decoded values in the RoPE region are discarded.
+//
+// args.head_dim   = 512
+// args.n_rot      = number of RoPE dims (args.pad)
+// args.row_bytes_in  = full encoded row stride (turbo + tail)
+// args.row_bytes_out = decoded half-row stride in bytes
+kernel void kernel_ds4_turbo_kv_rope_tail_decode(
+        constant ds4_metal_args_turbo & args,
+        device const uchar            * src,
+        device       half             * dst,
+        uint  row [[threadgroup_position_in_grid]],
+        ushort tid [[thread_position_in_threadgroup]]) {
+    if ((int)row >= args.n_rows) return;
+    const int head_dim = args.head_dim;
+    const int n_rot    = args.pad;
+    if (head_dim <= 0 || n_rot <= 0 || n_rot > head_dim) return;
+    if ((int)tid >= n_rot) return;
+
+    const uint src_stride = (uint)args.row_bytes_in;
+    const uint dst_stride = (uint)(args.row_bytes_out / sizeof(half));
+    const uint tail_off   = src_stride - (uint)n_rot * (uint)sizeof(half);
+
+    device const uchar * tail = src + (uint)row * src_stride + tail_off;
+    const ushort lo = (ushort)tail[(uint)tid * 2 + 0];
+    const ushort hi = (ushort)tail[(uint)tid * 2 + 1];
+    const ushort h  = lo | (hi << 8);
+
+    const uint nope = (uint)(head_dim - n_rot);
+    dst[(uint)row * dst_stride + nope + (uint)tid] = as_type<half>(h);
+}
+
 // Standalone WHT-128 helper for unit testing the transform in
 // isolation. args.bits = 0 -> forward (signs1 -> FWHT -> signs2).
 // args.bits = 1 -> inverse (signs2 -> FWHT -> signs1). The two

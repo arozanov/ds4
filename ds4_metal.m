@@ -88,6 +88,8 @@ static id<MTLComputePipelineState> g_ds4_turbo_quantize_row_pipeline;
 static id<MTLComputePipelineState> g_ds4_turbo_dequantize_row_pipeline;
 static id<MTLComputePipelineState> g_ds4_turbo_dequantize_batch_pipeline;
 static id<MTLComputePipelineState> g_ds4_turbo_wht_inplace_pipeline;
+static id<MTLComputePipelineState> g_ds4_turbo_kv_rope_tail_encode_pipeline;
+static id<MTLComputePipelineState> g_ds4_turbo_kv_rope_tail_decode_pipeline;
 static id<MTLComputePipelineState> g_dsv4_softmax_pool_pipeline;
 static id<MTLComputePipelineState> g_soft_max_f32_pipeline;
 static id<MTLComputePipelineState> g_soft_max_f32_4_pipeline;
@@ -2944,10 +2946,12 @@ int ds4_gpu_init(void) {
                 } \
             } while (0)
 
-        DS4_TURBO_PIPELINE_LOAD(g_ds4_turbo_quantize_row_pipeline,    "kernel_ds4_turbo_quantize_row");
-        DS4_TURBO_PIPELINE_LOAD(g_ds4_turbo_dequantize_row_pipeline,  "kernel_ds4_turbo_dequantize_row");
-        DS4_TURBO_PIPELINE_LOAD(g_ds4_turbo_dequantize_batch_pipeline,"kernel_ds4_turbo_dequantize_batch");
-        DS4_TURBO_PIPELINE_LOAD(g_ds4_turbo_wht_inplace_pipeline,     "kernel_ds4_turbo_wht_inplace");
+        DS4_TURBO_PIPELINE_LOAD(g_ds4_turbo_quantize_row_pipeline,        "kernel_ds4_turbo_quantize_row");
+        DS4_TURBO_PIPELINE_LOAD(g_ds4_turbo_dequantize_row_pipeline,      "kernel_ds4_turbo_dequantize_row");
+        DS4_TURBO_PIPELINE_LOAD(g_ds4_turbo_dequantize_batch_pipeline,    "kernel_ds4_turbo_dequantize_batch");
+        DS4_TURBO_PIPELINE_LOAD(g_ds4_turbo_wht_inplace_pipeline,         "kernel_ds4_turbo_wht_inplace");
+        DS4_TURBO_PIPELINE_LOAD(g_ds4_turbo_kv_rope_tail_encode_pipeline, "kernel_ds4_turbo_kv_rope_tail_encode");
+        DS4_TURBO_PIPELINE_LOAD(g_ds4_turbo_kv_rope_tail_decode_pipeline, "kernel_ds4_turbo_kv_rope_tail_decode");
         #undef DS4_TURBO_PIPELINE_LOAD
 
         fn = [library newFunctionWithName:@"kernel_swiglu_f32"];
@@ -6263,17 +6267,31 @@ static int ds4_gpu_turbo_bits_active(void) {
     return ds4_turbo_kv_bits_get();
 }
 
-/* The two arithmetic identities for the supported configurations:
- *   3-bit, head_dim 512: 16 blocks * 14 B = 224 B per row.
- *   4-bit, head_dim 512: 16 blocks * 18 B = 288 B per row.
- * We keep the formula inlined so the value matches the kernel's per-row
- * stride byte-for-byte. The GPU path encodes the full head_dim through
- * turbo (no fp16 RoPE tail); CPU and GPU turbo caches are independent. */
-static inline size_t ds4_gpu_turbo_row_bytes_512(int bits) {
-    const int n_blocks = 512 / 32; /* 16 */
+/* Match the CPU TurboQuant KV layout: a 512-dim turbo block followed by an
+ * fp16 RoPE tail covering the last DS4_GPU_TURBO_N_ROT (= 64) dims. The
+ * RoPE tail bypasses turbo so the attention positional encoding survives
+ * the round-trip; without it the last 128 bytes of every row hold a
+ * lossy reconstruction of a value the kernel must reproduce bit-for-bit.
+ *
+ *   3-bit row: 16 blocks * 14 B (= 224 B) + 64 * 2 B (= 128 B) = 352 B
+ *   4-bit row: 16 blocks * 18 B (= 288 B) + 64 * 2 B (= 128 B) = 416 B
+ *
+ * Constants are kept local to mirror the ones in ds4.c (DS4_N_HEAD_DIM,
+ * DS4_N_ROT). If either changes upstream both must move together. */
+#define DS4_GPU_TURBO_HEAD_DIM 512
+#define DS4_GPU_TURBO_N_ROT    64
+
+static inline size_t ds4_gpu_turbo_block_bytes_512(int bits) {
+    const int n_blocks = DS4_GPU_TURBO_HEAD_DIM / 32; /* 16 */
     if (bits == 3) return (size_t)n_blocks * 14u;
     if (bits == 4) return (size_t)n_blocks * 18u;
     return 0;
+}
+
+static inline size_t ds4_gpu_turbo_row_bytes_512(int bits) {
+    const size_t turbo_bytes = ds4_gpu_turbo_block_bytes_512(bits);
+    if (turbo_bytes == 0) return 0;
+    return turbo_bytes + (size_t)DS4_GPU_TURBO_N_ROT * sizeof(uint16_t);
 }
 
 /* Single-row encode dispatch. Threadgroup is 128 lanes (one rotation
@@ -6308,6 +6326,83 @@ static int ds4_gpu_turbo_encode_one_row(
     [enc setThreadgroupMemoryLength:672u * sizeof(float) atIndex:1];
     [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
          threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    ds4_gpu_end_compute_encoder(cb, enc);
+    return 1;
+}
+
+/* Write the fp16 RoPE tail of `n_rows` consecutive fp32 source rows into
+ * the matching tail slots of an already-quantized turbo cache. Each source
+ * row is `head_dim` fp32; each dst row is `dst_row_bytes` bytes (turbo
+ * prefix + fp16 tail). The tail copy lives in the last `n_rot * 2` bytes
+ * of each dst row. Source/dst buffers are passed already offset for the
+ * starting row pair. */
+static int ds4_gpu_turbo_encode_rope_tail_batch(
+        id<MTLCommandBuffer> cb,
+        id<MTLBuffer>        src_kv,
+        NSUInteger           src_offset,
+        id<MTLBuffer>        dst_buf,
+        NSUInteger           dst_offset,
+        uint32_t             n_rows,
+        int                  bits) {
+    if (!g_ds4_turbo_kv_rope_tail_encode_pipeline || n_rows == 0) return 0;
+
+    const size_t row_bytes_out = ds4_gpu_turbo_row_bytes_512(bits);
+    if (row_bytes_out == 0) return 0;
+
+    ds4_gpu_ds4_turbo_args args = {
+        .head_dim = DS4_GPU_TURBO_HEAD_DIM,
+        .bits = bits,
+        .n_rows = (int32_t)n_rows,
+        .pad = DS4_GPU_TURBO_N_ROT,            /* n_rot piggybacks on .pad */
+        .row_bytes_in = (uint64_t)row_bytes_out,
+        .row_bytes_out = (uint64_t)DS4_GPU_TURBO_HEAD_DIM * sizeof(float),
+    };
+
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+    [enc setComputePipelineState:g_ds4_turbo_kv_rope_tail_encode_pipeline];
+    [enc setBytes:&args length:sizeof(args) atIndex:0];
+    [enc setBuffer:src_kv offset:src_offset atIndex:1];
+    [enc setBuffer:dst_buf offset:dst_offset atIndex:2];
+    [enc dispatchThreadgroups:MTLSizeMake(n_rows, 1, 1)
+         threadsPerThreadgroup:MTLSizeMake(DS4_GPU_TURBO_N_ROT, 1, 1)];
+    ds4_gpu_end_compute_encoder(cb, enc);
+    return 1;
+}
+
+/* Overwrite the last n_rot halves of `n_rows` decoded rows in `dst_fp16`
+ * with the matching fp16 RoPE tail bytes from `src_buf`. Runs after the
+ * turbo dequant batch to repair the RoPE region the codebook cannot
+ * reproduce. Source row stride = encoded row bytes; dst row stride =
+ * head_dim halves. */
+static int ds4_gpu_turbo_decode_rope_tail_batch(
+        id<MTLCommandBuffer> cb,
+        id<MTLBuffer>        src_buf,
+        NSUInteger           src_offset,
+        id<MTLBuffer>        dst_fp16,
+        NSUInteger           dst_offset,
+        uint32_t             n_rows,
+        int                  bits) {
+    if (!g_ds4_turbo_kv_rope_tail_decode_pipeline || n_rows == 0) return 0;
+
+    const size_t row_bytes_in = ds4_gpu_turbo_row_bytes_512(bits);
+    if (row_bytes_in == 0) return 0;
+
+    ds4_gpu_ds4_turbo_args args = {
+        .head_dim = DS4_GPU_TURBO_HEAD_DIM,
+        .bits = bits,
+        .n_rows = (int32_t)n_rows,
+        .pad = DS4_GPU_TURBO_N_ROT,
+        .row_bytes_in = (uint64_t)row_bytes_in,
+        .row_bytes_out = (uint64_t)DS4_GPU_TURBO_HEAD_DIM * sizeof(uint16_t),
+    };
+
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+    [enc setComputePipelineState:g_ds4_turbo_kv_rope_tail_decode_pipeline];
+    [enc setBytes:&args length:sizeof(args) atIndex:0];
+    [enc setBuffer:src_buf offset:src_offset atIndex:1];
+    [enc setBuffer:dst_fp16 offset:dst_offset atIndex:2];
+    [enc dispatchThreadgroups:MTLSizeMake(n_rows, 1, 1)
+         threadsPerThreadgroup:MTLSizeMake(DS4_GPU_TURBO_N_ROT, 1, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
     return 1;
 }
@@ -6388,6 +6483,16 @@ static int ds4_gpu_kv_turbo_store_one(
                                             bits)) {
             return 0;
         }
+        /* Overlay the fp16 RoPE tail so attention reads the original
+         * positional encoding instead of the codebook reconstruction.
+         * Mirrors kv_turbo_encode_row in ds4.c. */
+        if (!ds4_gpu_turbo_encode_rope_tail_batch(cb,
+                                                    kvbuf, ds4_gpu_tensor_offset(kv),
+                                                    rawbuf, dst_off,
+                                                    1,
+                                                    bits)) {
+            return 0;
+        }
 
         if (!ds4_gpu_finish_command_buffer(cb, owned, "turbo KV store")) return 0;
     }
@@ -6441,7 +6546,9 @@ static int ds4_gpu_kv_turbo_store_batch(
          * index, assuming logically contiguous rows. Since we want
          * `dst_row = (pos0 + t) % raw_cap` (which is non-contiguous when
          * the window wraps), we dispatch each row individually. n_tokens
-         * is bounded by the model SWA window in normal use. */
+         * is bounded by the model SWA window in normal use. After the
+         * turbo block we also overlay the fp16 RoPE tail so the encoded
+         * row matches the CPU layout byte-for-byte. */
         for (uint32_t t = 0; t < n_tokens; t++) {
             const uint32_t row = (pos0 + t) % raw_cap;
             const NSUInteger src_off = kv_off0 + (NSUInteger)t * (NSUInteger)head_dim * sizeof(float);
@@ -6457,6 +6564,14 @@ static int ds4_gpu_kv_turbo_store_batch(
             [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
                  threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
             ds4_gpu_end_compute_encoder(cb, enc);
+
+            if (!ds4_gpu_turbo_encode_rope_tail_batch(cb,
+                                                        kvbuf, src_off,
+                                                        rawbuf, dst_off,
+                                                        1,
+                                                        bits)) {
+                return 0;
+            }
         }
 
         if (!ds4_gpu_finish_command_buffer(cb, owned, "turbo KV batch store")) return 0;
@@ -6488,32 +6603,42 @@ static int ds4_gpu_encode_turbo_dequant_to_kv_scratch(
     const NSUInteger raw_off0 = ds4_gpu_tensor_offset(raw_cache);
     const NSUInteger half_row = 512u * sizeof(uint16_t);
 
+    /* Each segment is (turbo dequant -> RoPE tail overlay) so the
+     * decoded fp16 row reproduces the CPU layout exactly: turbo for
+     * the first 448 dims, fp16 verbatim for the last 64. */
     if (raw_start + n_raw <= raw_cap) {
+        const NSUInteger seg_src = raw_off0 + (NSUInteger)raw_start * (NSUInteger)row_bytes;
         return ds4_gpu_turbo_dequantize_batch(cb,
-                                                rawbuf,
-                                                raw_off0 + (NSUInteger)raw_start * (NSUInteger)row_bytes,
-                                                dst_fp16,
-                                                dst_offset,
-                                                n_raw,
-                                                bits);
+                                                rawbuf, seg_src,
+                                                dst_fp16, dst_offset,
+                                                n_raw, bits) &&
+               ds4_gpu_turbo_decode_rope_tail_batch(cb,
+                                                      rawbuf, seg_src,
+                                                      dst_fp16, dst_offset,
+                                                      n_raw, bits);
     }
 
     const uint32_t tail = raw_cap - raw_start;
     const uint32_t head = n_raw - tail;
+    const NSUInteger tail_src = raw_off0 + (NSUInteger)raw_start * (NSUInteger)row_bytes;
+    const NSUInteger head_src = raw_off0;
+    const NSUInteger head_dst = dst_offset + (NSUInteger)tail * half_row;
     return ds4_gpu_turbo_dequantize_batch(cb,
-                                            rawbuf,
-                                            raw_off0 + (NSUInteger)raw_start * (NSUInteger)row_bytes,
-                                            dst_fp16,
-                                            dst_offset,
-                                            tail,
-                                            bits) &&
+                                            rawbuf, tail_src,
+                                            dst_fp16, dst_offset,
+                                            tail, bits) &&
+           ds4_gpu_turbo_decode_rope_tail_batch(cb,
+                                                  rawbuf, tail_src,
+                                                  dst_fp16, dst_offset,
+                                                  tail, bits) &&
            ds4_gpu_turbo_dequantize_batch(cb,
-                                            rawbuf,
-                                            raw_off0,
-                                            dst_fp16,
-                                            dst_offset + (NSUInteger)tail * half_row,
-                                            head,
-                                            bits);
+                                            rawbuf, head_src,
+                                            dst_fp16, head_dst,
+                                            head, bits) &&
+           ds4_gpu_turbo_decode_rope_tail_batch(cb,
+                                                  rawbuf, head_src,
+                                                  dst_fp16, head_dst,
+                                                  head, bits);
 }
 
 static int ds4_gpu_encode_compressor_score_with_ape(
