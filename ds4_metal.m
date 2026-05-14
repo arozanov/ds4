@@ -6267,6 +6267,25 @@ static int ds4_gpu_turbo_bits_active(void) {
     return ds4_turbo_kv_bits_get();
 }
 
+/* Diagnostic trace gate for the turbo KV store/read path. Enabled when
+ * DS4_TURBO_TRACE=1 (or any non-empty value). Cached on first call so the
+ * hot path is one branch on the int. */
+static int ds4_gpu_turbo_trace_enabled(void) {
+    static int state = -1;
+    if (state < 0) {
+        const char *env = getenv("DS4_TURBO_TRACE");
+        state = (env && env[0] && env[0] != '0') ? 1 : 0;
+    }
+    return state;
+}
+
+#define DS4_TURBO_TRACE(fmt, ...)                                    \
+    do {                                                              \
+        if (ds4_gpu_turbo_trace_enabled()) {                          \
+            fprintf(stderr, "ds4-turbo: " fmt "\n", ##__VA_ARGS__);   \
+        }                                                             \
+    } while (0)
+
 /* Match the CPU TurboQuant KV layout: a 512-dim turbo block followed by an
  * fp16 RoPE tail covering the last DS4_GPU_TURBO_N_ROT (= 64) dims. The
  * RoPE tail bypasses turbo so the attention positional encoding survives
@@ -6419,6 +6438,8 @@ static int ds4_gpu_turbo_dequantize_batch(
         uint32_t             n_rows,
         int                  bits) {
     if (!g_ds4_turbo_dequantize_batch_pipeline || n_rows == 0) return 0;
+    DS4_TURBO_TRACE("dequant_batch n_rows=%u bits=%d src_off=%lu dst_off=%lu",
+                    n_rows, bits, (unsigned long)src_offset, (unsigned long)dst_offset);
 
     const size_t row_bytes_in = ds4_gpu_turbo_row_bytes_512(bits);
     if (row_bytes_in == 0) return 0;
@@ -6458,6 +6479,8 @@ static int ds4_gpu_kv_turbo_store_one(
         int               bits) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!raw_cache || !kv || raw_cap == 0 || row >= raw_cap || head_dim != 512) return 0;
+    DS4_TURBO_TRACE("store_one  raw_cache=%p row=%u/%u head_dim=%u bits=%d",
+                    (void *)raw_cache, row, raw_cap, head_dim, bits);
 
     @autoreleasepool {
         id<MTLBuffer> rawbuf = ds4_gpu_tensor_buffer(raw_cache);
@@ -6513,6 +6536,8 @@ static int ds4_gpu_kv_turbo_store_batch(
         int               bits) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!raw_cache || !kv || raw_cap == 0 || n_tokens == 0 || head_dim != 512) return 0;
+    DS4_TURBO_TRACE("store_batch raw_cache=%p pos0=%u n_tokens=%u raw_cap=%u head_dim=%u bits=%d",
+                    (void *)raw_cache, pos0, n_tokens, raw_cap, head_dim, bits);
 
     @autoreleasepool {
         id<MTLBuffer> rawbuf = ds4_gpu_tensor_buffer(raw_cache);
@@ -6602,6 +6627,10 @@ static int ds4_gpu_encode_turbo_dequant_to_kv_scratch(
     const size_t row_bytes = ds4_gpu_turbo_row_bytes_512(bits);
     const NSUInteger raw_off0 = ds4_gpu_tensor_offset(raw_cache);
     const NSUInteger half_row = 512u * sizeof(uint16_t);
+
+    const int wraps = (raw_start + n_raw > raw_cap) ? 1 : 0;
+    DS4_TURBO_TRACE("dequant_to_kv_scratch raw_cache=%p raw_cap=%u raw_start=%u n_raw=%u bits=%d wraps=%d row_bytes=%zu",
+                    (void *)raw_cache, raw_cap, raw_start, n_raw, bits, wraps, row_bytes);
 
     /* Each segment is (turbo dequant -> RoPE tail overlay) so the
      * decoded fp16 row reproduces the CPU layout exactly: turbo for
@@ -9382,6 +9411,8 @@ static int ds4_gpu_encode_flash_attention_prefill_static_mixed_heads_nonvec_long
     if (head_dim != 512 || n_head == 0 || n_tokens == 0 || ratio == 0) {
         return 0;
     }
+    DS4_TURBO_TRACE("prefill_static_mixed_nonvec_long n_tokens=%u n_comp=%u window=%u ratio=%u",
+                    n_tokens, n_comp, window, ratio);
 
     const uint32_t n_keys = n_tokens + n_comp;
     id<MTLBuffer> qbuf = ds4_gpu_tensor_buffer(q);
@@ -9896,6 +9927,7 @@ static int ds4_gpu_encode_flash_attention_prefill_raw_heads_nonvec(
         uint32_t               window,
         uint32_t               n_head,
         uint32_t               head_dim) {
+    DS4_TURBO_TRACE("prefill_raw_heads_nonvec n_tokens=%u window=%u", n_tokens, window);
     if (head_dim != 512 || n_head == 0 || n_tokens == 0) {
         return 0;
     }
@@ -10576,6 +10608,8 @@ static int ds4_gpu_encode_flash_attention_decode_raw_batch_heads(
         n_raw == 0 || raw_cap < n_raw || raw_start >= raw_cap) {
         return 0;
     }
+    DS4_TURBO_TRACE("decode_raw_batch n_tokens=%u pos0=%u n_raw=%u raw_cap=%u raw_start=%u window=%u",
+                    n_tokens, pos0, n_raw, raw_cap, raw_start, window);
 
     id<MTLBuffer> qbuf = ds4_gpu_tensor_buffer(q);
     id<MTLBuffer> rawbuf = ds4_gpu_tensor_buffer(raw_kv);
@@ -10833,6 +10867,8 @@ static int ds4_gpu_encode_flash_attention_decode_mixed_batch_heads(
         uint32_t               ratio,
         uint32_t               n_head,
         uint32_t               head_dim) {
+    DS4_TURBO_TRACE("decode_mixed_batch n_tokens=%u pos0=%u n_raw=%u raw_cap=%u raw_start=%u n_comp=%u window=%u ratio=%u",
+                    n_tokens, pos0, n_raw, raw_cap, raw_start, n_comp, window, ratio);
     if (n_comp == 0) {
         return ds4_gpu_encode_flash_attention_decode_raw_batch_heads(cb,
                                                                        heads,

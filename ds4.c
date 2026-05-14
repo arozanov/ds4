@@ -11389,6 +11389,19 @@ static bool metal_graph_encode_layer_attention_batch(
     const bool raw_batch_attention = zero_prefix && ratio == 0;
     bool batch_attention_done = false;
 
+    {
+        static int trace_state = -1;
+        if (trace_state < 0) {
+            const char *env = getenv("DS4_TURBO_TRACE");
+            trace_state = (env && env[0] && env[0] != '0') ? 1 : 0;
+        }
+        if (trace_state) {
+            fprintf(stderr,
+                    "ds4-turbo: encode_layer_attention il=%u pos0=%u n_tokens=%u ratio=%u zero_prefix=%d raw_cap=%u\n",
+                    il, pos0, n_tokens, ratio, (int)zero_prefix, g->raw_cap);
+        }
+    }
+
     if (ok && raw_batch_attention) {
         ok = ds4_gpu_attention_prefill_raw_heads_tensor(g->batch_heads,
                                                           model->map,
