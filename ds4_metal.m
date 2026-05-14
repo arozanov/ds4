@@ -47,7 +47,6 @@ static id<MTLComputePipelineState> g_concat_pipeline;
 static id<MTLComputePipelineState> g_cpy_f32_f32_pipeline;
 static id<MTLComputePipelineState> g_cpy_f32_f16_pipeline;
 static id<MTLComputePipelineState> g_cpy_f16_f32_pipeline;
-static id<MTLComputePipelineState> g_cpy_f16_f16_pipeline;
 static id<MTLComputePipelineState> g_swiglu_pipeline;
 static id<MTLComputePipelineState> g_add_pipeline;
 static id<MTLComputePipelineState> g_mul_pipeline;
@@ -323,14 +322,6 @@ static uint64_t round_up_u64(uint64_t v, uint64_t align) {
 
 static id<MTLComputePipelineState> ds4_gpu_get_pipeline(const char *function_name);
 static int ds4_gpu_warm_model_views(void);
-static void ds4_gpu_turbo_dequant_cache_reset(void);
-static int ds4_gpu_encode_cpy_f16_f16_1d(
-        id<MTLCommandBuffer> cb,
-        id<MTLBuffer>        src,
-        NSUInteger           src_off,
-        id<MTLBuffer>        dst,
-        NSUInteger           dst_off,
-        uint32_t             n);
 
 static double ds4_gpu_now_ms(void) {
     struct timespec ts;
@@ -2889,23 +2880,6 @@ int ds4_gpu_init(void) {
             return 0;
         }
 
-        fn = [library newFunctionWithName:@"kernel_cpy_f16_f16"];
-        if (!fn) {
-            fprintf(stderr, "ds4: Metal kernel_cpy_f16_f16 function not found\n");
-            g_queue = nil;
-            g_device = nil;
-            return 0;
-        }
-
-        g_cpy_f16_f16_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
-        if (!g_cpy_f16_f16_pipeline) {
-            fprintf(stderr, "ds4: Metal kernel_cpy_f16_f16 pipeline failed: %s\n",
-                    [[error localizedDescription] UTF8String]);
-            g_queue = nil;
-            g_device = nil;
-            return 0;
-        }
-
         fn = [library newFunctionWithName:@"kernel_dsv4_fp8_kv_quantize_f32"];
         if (!fn) {
             fprintf(stderr, "ds4: Metal kernel_dsv4_fp8_kv_quantize_f32 function not found\n");
@@ -4032,7 +4006,6 @@ void ds4_gpu_cleanup(void) {
         g_cpy_f32_f32_pipeline = nil;
         g_cpy_f32_f16_pipeline = nil;
         g_cpy_f16_f32_pipeline = nil;
-        g_cpy_f16_f16_pipeline = nil;
         g_swiglu_pipeline = nil;
         g_add_pipeline = nil;
         g_mul_pipeline = nil;
@@ -4147,7 +4120,6 @@ void ds4_gpu_cleanup(void) {
         g_model_wrap_count = 0;
         g_model_wrap_bytes = 0;
         g_model_wrap_max_bytes = 0;
-        ds4_gpu_turbo_dequant_cache_reset();
         ds4_gpu_model_residency_clear();
         ds4_gpu_model_views_clear();
         [g_pipeline_cache removeAllObjects];
@@ -6314,182 +6286,6 @@ static int ds4_gpu_turbo_trace_enabled(void) {
         }                                                             \
     } while (0)
 
-/* Per-layer persistent fp16 dequant scratch.
- *
- * Decode-time attention reads a small SWA window (up to raw_cap rows) but each
- * step only writes one new row to the raw cache. Re-dequantizing the entire
- * window on every step makes decode cost grow linearly with cache fill level,
- * which dominates the long-context regression. Cache the dequanted rows per
- * layer in PHYSICAL row order so we only re-dequant rows that were rewritten
- * since the last call. The final logical (oldest-first) view required by
- * flash_attn is materialized via a cheap fp16->fp16 ring-copy into the
- * caller's destination buffer.
- *
- * State is keyed by the raw_cache MTLBuffer pointer + base offset, which is
- * a stable per-layer identity (the buffers are allocated once at graph
- * construction and reused for every step). We store entries in a small linear
- * table since DS4_N_LAYER is fixed at 43; lookup cost is negligible.
- *
- * "dirty_mask" is a bit per physical row: set when the row was written but
- * not yet dequanted into the scratch. Prefill paths always force a full
- * dequant (mark all dirty before, mark all clean after) so that prefill
- * remains unchanged. */
-typedef struct ds4_gpu_turbo_dequant_cache_entry {
-    id<MTLBuffer> raw_buf;     /* identity: same MTLBuffer = same layer cache */
-    NSUInteger    raw_base;    /* base offset within raw_buf (tensor offset)  */
-    uint32_t      raw_cap;     /* physical row count                          */
-    int           bits;        /* 3 / 4 / 6 / 8                               */
-    id<MTLBuffer> scratch;     /* raw_cap rows, each head_dim * sizeof(half)  */
-    uint64_t     *dirty_mask;  /* bit `i` set => physical row i needs dequant */
-    uint32_t      dirty_words; /* number of uint64 words in dirty_mask        */
-    int           initialized; /* 0 until the first store/dequant call        */
-} ds4_gpu_turbo_dequant_cache_entry;
-
-#define DS4_TURBO_DEQUANT_CACHE_MAX 64  /* DS4_N_LAYER==43 + speculative slack */
-
-static ds4_gpu_turbo_dequant_cache_entry g_turbo_dequant_cache[DS4_TURBO_DEQUANT_CACHE_MAX];
-static uint32_t                          g_turbo_dequant_cache_count;
-
-static int ds4_gpu_turbo_decode_persistent_enabled(void) {
-    /* Optional kill-switch so the optimization can be disabled without a
-     * rebuild if it ever misbehaves. Default: ON. */
-    static int state = -1;
-    if (state < 0) {
-        const char *env = getenv("DS4_TURBO_DECODE_PERSISTENT");
-        state = (env && env[0] == '0') ? 0 : 1;
-    }
-    return state;
-}
-
-static void ds4_gpu_turbo_dequant_cache_mark_all_dirty(
-        ds4_gpu_turbo_dequant_cache_entry *e) {
-    if (!e || !e->dirty_mask) return;
-    for (uint32_t i = 0; i < e->dirty_words; i++) e->dirty_mask[i] = ~(uint64_t)0;
-}
-
-static void ds4_gpu_turbo_dequant_cache_mark_dirty_row(
-        ds4_gpu_turbo_dequant_cache_entry *e, uint32_t row) {
-    if (!e || !e->dirty_mask || row >= e->raw_cap) return;
-    e->dirty_mask[row >> 6] |= ((uint64_t)1) << (row & 63u);
-}
-
-static int ds4_gpu_turbo_dequant_cache_row_dirty(
-        const ds4_gpu_turbo_dequant_cache_entry *e, uint32_t row) {
-    if (!e || !e->dirty_mask || row >= e->raw_cap) return 1;
-    return (e->dirty_mask[row >> 6] >> (row & 63u)) & 1u;
-}
-
-static ds4_gpu_turbo_dequant_cache_entry *ds4_gpu_turbo_dequant_cache_get(
-        id<MTLBuffer> raw_buf,
-        NSUInteger    raw_base,
-        uint32_t      raw_cap,
-        int           bits,
-        int           create) {
-    if (!raw_buf || raw_cap == 0) return NULL;
-    for (uint32_t i = 0; i < g_turbo_dequant_cache_count; i++) {
-        ds4_gpu_turbo_dequant_cache_entry *e = &g_turbo_dequant_cache[i];
-        if (e->raw_buf == raw_buf && e->raw_base == raw_base) {
-            /* If the geometry or bit width changes (e.g. context resize),
-             * invalidate the cache by tearing down the old scratch. */
-            if (e->raw_cap != raw_cap || e->bits != bits) {
-                e->scratch = nil;
-                free(e->dirty_mask);
-                e->dirty_mask = NULL;
-                e->dirty_words = 0;
-                e->initialized = 0;
-                e->raw_cap = raw_cap;
-                e->bits = bits;
-            }
-            return e;
-        }
-    }
-    if (!create) return NULL;
-    if (g_turbo_dequant_cache_count >= DS4_TURBO_DEQUANT_CACHE_MAX) {
-        /* Cache full: callers will fall back to the full-dequant path. */
-        return NULL;
-    }
-    ds4_gpu_turbo_dequant_cache_entry *e =
-        &g_turbo_dequant_cache[g_turbo_dequant_cache_count++];
-    e->raw_buf = raw_buf;
-    e->raw_base = raw_base;
-    e->raw_cap = raw_cap;
-    e->bits = bits;
-    e->scratch = nil;
-    e->dirty_mask = NULL;
-    e->dirty_words = 0;
-    e->initialized = 0;
-    return e;
-}
-
-static int ds4_gpu_turbo_dequant_cache_ensure(
-        ds4_gpu_turbo_dequant_cache_entry *e) {
-    if (!e) return 0;
-    const NSUInteger row_bytes_f16 = 512u * sizeof(uint16_t);
-    const NSUInteger bytes = (NSUInteger)e->raw_cap * row_bytes_f16;
-    if (!e->scratch) {
-        e->scratch = [g_device newBufferWithLength:bytes
-                                            options:MTLResourceStorageModeShared];
-        if (!e->scratch) {
-            fprintf(stderr,
-                    "ds4: failed to allocate turbo dequant scratch (%llu bytes)\n",
-                    (unsigned long long)bytes);
-            return 0;
-        }
-        e->scratch.label = @"ds4_turbo_dequant_scratch_persistent";
-    }
-    if (!e->dirty_mask) {
-        e->dirty_words = (e->raw_cap + 63u) / 64u;
-        e->dirty_mask = calloc(e->dirty_words, sizeof(uint64_t));
-        if (!e->dirty_mask) {
-            e->dirty_words = 0;
-            fprintf(stderr, "ds4: failed to allocate turbo dequant dirty mask\n");
-            return 0;
-        }
-        /* New scratch holds no valid dequanted rows yet. */
-        ds4_gpu_turbo_dequant_cache_mark_all_dirty(e);
-    }
-    return 1;
-}
-
-static void ds4_gpu_turbo_dequant_cache_reset(void) {
-    for (uint32_t i = 0; i < g_turbo_dequant_cache_count; i++) {
-        ds4_gpu_turbo_dequant_cache_entry *e = &g_turbo_dequant_cache[i];
-        e->raw_buf = nil;
-        e->scratch = nil;
-        free(e->dirty_mask);
-        e->dirty_mask = NULL;
-        e->dirty_words = 0;
-        e->raw_cap = 0;
-        e->bits = 0;
-        e->initialized = 0;
-        e->raw_base = 0;
-    }
-    g_turbo_dequant_cache_count = 0;
-}
-
-/* Look up the cache for a raw_cache tensor and mark the given physical rows
- * dirty. Called from the turbo store paths after every write so the next
- * dequant call re-decodes those rows. No-op when the persistent decode path
- * is disabled or the entry hasn't been created yet. */
-static void ds4_gpu_turbo_dequant_cache_invalidate_rows(
-        const ds4_gpu_tensor *raw_cache,
-        uint32_t              raw_cap,
-        int                   bits,
-        uint32_t              row_first,
-        uint32_t              n_rows) {
-    if (!raw_cache || raw_cap == 0 || n_rows == 0) return;
-    if (!ds4_gpu_turbo_decode_persistent_enabled()) return;
-    id<MTLBuffer> raw_buf = ds4_gpu_tensor_buffer(raw_cache);
-    if (!raw_buf) return;
-    const NSUInteger raw_base = ds4_gpu_tensor_offset(raw_cache);
-    ds4_gpu_turbo_dequant_cache_entry *e =
-        ds4_gpu_turbo_dequant_cache_get(raw_buf, raw_base, raw_cap, bits, 0);
-    if (!e || !e->dirty_mask) return;
-    for (uint32_t r = 0; r < n_rows; r++) {
-        ds4_gpu_turbo_dequant_cache_mark_dirty_row(e, (row_first + r) % raw_cap);
-    }
-}
-
 /* Match the CPU TurboQuant KV layout: a 512-dim turbo block followed by an
  * fp16 RoPE tail covering the last DS4_GPU_TURBO_N_ROT (= 64) dims. The
  * RoPE tail bypasses turbo so the attention positional encoding survives
@@ -6728,11 +6524,6 @@ static int ds4_gpu_kv_turbo_store_one(
         if (!ds4_gpu_finish_command_buffer(cb, owned, "turbo KV store")) return 0;
     }
 
-    /* Tell the persistent dequant cache to re-decode this row before the
-     * next attention call. Done outside the autoreleasepool so we don't
-     * pin GPU buffers any longer than necessary. */
-    ds4_gpu_turbo_dequant_cache_invalidate_rows(raw_cache, raw_cap, bits, row, 1);
-
     return 1;
 }
 
@@ -6815,59 +6606,14 @@ static int ds4_gpu_kv_turbo_store_batch(
         if (!ds4_gpu_finish_command_buffer(cb, owned, "turbo KV batch store")) return 0;
     }
 
-    /* Mark every physical row we just wrote as dirty in the persistent
-     * dequant cache so the next attention call re-decodes them. */
-    ds4_gpu_turbo_dequant_cache_invalidate_rows(raw_cache, raw_cap, bits, pos0, n_tokens);
-
     return 1;
 }
 
-/* Batch-dequant a contiguous run of physical rows [first, first + n) into
- * `dst_fp16` starting at `dst_offset_first`, where the output rows are also
- * contiguous (one half_row stride apart). */
-static int ds4_gpu_turbo_dequant_phys_run(
-        id<MTLCommandBuffer>  cb,
-        id<MTLBuffer>         rawbuf,
-        NSUInteger            raw_off0,
-        size_t                row_bytes,
-        uint32_t              first,
-        uint32_t              n,
-        id<MTLBuffer>         dst_fp16,
-        NSUInteger            dst_offset_first,
-        int                   bits) {
-    if (n == 0) return 1;
-    const NSUInteger src_off = raw_off0 + (NSUInteger)first * (NSUInteger)row_bytes;
-    return ds4_gpu_turbo_dequantize_batch(cb,
-                                            rawbuf, src_off,
-                                            dst_fp16, dst_offset_first,
-                                            n, bits) &&
-           ds4_gpu_turbo_decode_rope_tail_batch(cb,
-                                                  rawbuf, src_off,
-                                                  dst_fp16, dst_offset_first,
-                                                  n, bits);
-}
-
 /* Pre-flash-attn dequant: decode `n_raw` turbo rows starting at physical
- * row `raw_start` into a fp16 scratch buffer.
- *
- * Two strategies, selected per call:
- *
- *  1. Persistent (decode hot path): when DS4_TURBO_DECODE_PERSISTENT is on
- *     (default) and we have a per-layer scratch with at least one clean
- *     row, dequant only the physically rewritten rows into the per-layer
- *     scratch, then issue a one- or two-segment fp16->fp16 ring copy into
- *     `dst_fp16` so the caller sees the same oldest-first layout it had
- *     before. This makes decode cost O(rows_written_since_last_dequant)
- *     instead of O(n_raw).
- *
- *  2. Direct (prefill / cold start / disabled): dequant the visible window
- *     straight into `dst_fp16` exactly as before. We always fall back to
- *     this when we can't use the persistent scratch for any reason so the
- *     dispatcher remains safe by default.
- *
- * Whichever path runs, after a successful dequant the cache entry has every
- * row in the visible window marked clean. Rows outside the window are left
- * dirty so that they get re-decoded when they slide back in. */
+ * row `raw_start` into a fp16 scratch buffer. If the SWA window wraps
+ * (raw_start != 0 and raw_start + n_raw > raw_cap), we issue two dispatches
+ * so that the output is in logical (oldest-first) order, matching what the
+ * fp32 path produces with the ring-rotation copy. */
 static int ds4_gpu_encode_turbo_dequant_to_kv_scratch(
         id<MTLCommandBuffer>  cb,
         const ds4_gpu_tensor *raw_cache,
@@ -6890,115 +6636,9 @@ static int ds4_gpu_encode_turbo_dequant_to_kv_scratch(
     DS4_TURBO_TRACE("dequant_to_kv_scratch raw_cache=%p raw_cap=%u raw_start=%u n_raw=%u bits=%d wraps=%d row_bytes=%zu",
                     (void *)raw_cache, raw_cap, raw_start, n_raw, bits, wraps, row_bytes);
 
-    /* Persistent path. Only engages when the optimization is enabled, the
-     * window is no larger than the physical ring, and the cache allocation
-     * succeeds. Anything else falls through to the direct dequant below. */
-    if (ds4_gpu_turbo_decode_persistent_enabled() &&
-        n_raw <= raw_cap && g_cpy_f16_f16_pipeline) {
-        ds4_gpu_turbo_dequant_cache_entry *e =
-            ds4_gpu_turbo_dequant_cache_get(rawbuf, raw_off0, raw_cap, bits, 1);
-        if (e && ds4_gpu_turbo_dequant_cache_ensure(e)) {
-            /* 1) Refresh dirty rows that fall inside the visible window.
-             *    We walk the window in logical order so that physically
-             *    adjacent dirty rows merge into a single multi-row dispatch
-             *    (cheaper than one dispatch per row for the prefill burst
-             *    where the entire window comes back dirty). */
-            uint32_t run_first = 0;
-            uint32_t run_len = 0;
-            int ok = 1;
-            for (uint32_t i = 0; i < n_raw && ok; i++) {
-                const uint32_t phys = (raw_start + i) % raw_cap;
-                if (ds4_gpu_turbo_dequant_cache_row_dirty(e, phys)) {
-                    if (run_len == 0) {
-                        run_first = phys;
-                        run_len = 1;
-                    } else if (phys == run_first + run_len) {
-                        run_len++;
-                    } else {
-                        ok = ds4_gpu_turbo_dequant_phys_run(
-                                cb, rawbuf, raw_off0, row_bytes,
-                                run_first, run_len,
-                                e->scratch,
-                                (NSUInteger)run_first * half_row,
-                                bits);
-                        if (!ok) break;
-                        run_first = phys;
-                        run_len = 1;
-                    }
-                } else if (run_len) {
-                    ok = ds4_gpu_turbo_dequant_phys_run(
-                            cb, rawbuf, raw_off0, row_bytes,
-                            run_first, run_len,
-                            e->scratch,
-                            (NSUInteger)run_first * half_row,
-                            bits);
-                    if (!ok) break;
-                    run_len = 0;
-                }
-            }
-            if (ok && run_len) {
-                ok = ds4_gpu_turbo_dequant_phys_run(
-                        cb, rawbuf, raw_off0, row_bytes,
-                        run_first, run_len,
-                        e->scratch,
-                        (NSUInteger)run_first * half_row,
-                        bits);
-            }
-            if (ok) {
-                /* Mark every refreshed row clean. We only refreshed rows
-                 * inside the visible window, so do that one row at a time
-                 * (bitmask is tiny: 36 uint64 words for raw_cap=2304). */
-                for (uint32_t i = 0; i < n_raw; i++) {
-                    const uint32_t phys = (raw_start + i) % raw_cap;
-                    e->dirty_mask[phys >> 6] &= ~(((uint64_t)1) << (phys & 63u));
-                }
-                e->initialized = 1;
-
-                /* 2) Stamp the visible window into the caller's destination
-                 *    buffer in logical (oldest-first) order. fp16->fp16 ring
-                 *    copy is a fraction of the dequant cost. */
-                if (n_raw + raw_start <= raw_cap) {
-                    ok = ds4_gpu_encode_cpy_f16_f16_1d(
-                            cb,
-                            e->scratch,
-                            (NSUInteger)raw_start * half_row,
-                            dst_fp16,
-                            dst_offset,
-                            n_raw * 512u);
-                } else {
-                    const uint32_t tail_rows = raw_cap - raw_start;
-                    const uint32_t head_rows = n_raw - tail_rows;
-                    ok = ds4_gpu_encode_cpy_f16_f16_1d(
-                            cb,
-                            e->scratch,
-                            (NSUInteger)raw_start * half_row,
-                            dst_fp16,
-                            dst_offset,
-                            tail_rows * 512u) &&
-                         ds4_gpu_encode_cpy_f16_f16_1d(
-                            cb,
-                            e->scratch,
-                            0,
-                            dst_fp16,
-                            dst_offset + (NSUInteger)tail_rows * half_row,
-                            head_rows * 512u);
-                }
-                if (ok) return 1;
-                /* Copy failed: fall through to the direct path. The cache
-                 * may now be stale, so mark it dirty before retrying. */
-                ds4_gpu_turbo_dequant_cache_mark_all_dirty(e);
-            } else {
-                /* Dequant into persistent scratch failed: invalidate and
-                 * fall back so we never return partial data. */
-                ds4_gpu_turbo_dequant_cache_mark_all_dirty(e);
-            }
-        }
-    }
-
-    /* Direct path (unchanged from the original implementation). Each segment
-     * is (turbo dequant -> RoPE tail overlay) so the decoded fp16 row
-     * reproduces the CPU layout exactly: turbo for the first 448 dims, fp16
-     * verbatim for the last 64. */
+    /* Each segment is (turbo dequant -> RoPE tail overlay) so the
+     * decoded fp16 row reproduces the CPU layout exactly: turbo for
+     * the first 448 dims, fp16 verbatim for the last 64. */
     if (raw_start + n_raw <= raw_cap) {
         const NSUInteger seg_src = raw_off0 + (NSUInteger)raw_start * (NSUInteger)row_bytes;
         return ds4_gpu_turbo_dequantize_batch(cb,
@@ -9364,32 +9004,6 @@ static int ds4_gpu_encode_cpy_f32_f16_2d(
     [enc setBuffer:src offset:src_off atIndex:1];
     [enc setBuffer:dst offset:dst_off atIndex:2];
     [enc dispatchThreadgroups:MTLSizeMake(col_groups * rows, 1, 1)
-         threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
-    ds4_gpu_end_compute_encoder(cb, enc);
-
-    return 1;
-}
-
-static int ds4_gpu_encode_cpy_f16_f16_1d(
-        id<MTLCommandBuffer> cb,
-        id<MTLBuffer>        src,
-        NSUInteger           src_off,
-        id<MTLBuffer>        dst,
-        NSUInteger           dst_off,
-        uint32_t             n) {
-    if (!cb || !src || !dst || n == 0) return 0;
-
-    ds4_gpu_cpy_args args =
-        ds4_gpu_make_cpy_1d_args(n, sizeof(uint16_t), sizeof(uint16_t));
-    const NSUInteger nth = ds4_gpu_cpy_threads(n, g_cpy_f16_f16_pipeline);
-    const NSUInteger groups = ((NSUInteger)n + nth - 1u) / nth;
-
-    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
-    [enc setComputePipelineState:g_cpy_f16_f16_pipeline];
-    [enc setBytes:&args length:sizeof(args) atIndex:0];
-    [enc setBuffer:src offset:src_off atIndex:1];
-    [enc setBuffer:dst offset:dst_off atIndex:2];
-    [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
          threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
 
