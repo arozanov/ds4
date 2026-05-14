@@ -34,7 +34,7 @@ endif
 
 .PHONY: all clean test cpu cuda-regression
 
-all: ds4 ds4-server ds4-bench
+all: ds4 ds4-server ds4-bench ds4_perplexity
 
 ifeq ($(UNAME_S),Darwin)
 ds4: ds4_cli.o linenoise.o $(CORE_OBJS)
@@ -46,10 +46,14 @@ ds4-server: ds4_server.o rax.o $(CORE_OBJS)
 ds4-bench: ds4_bench.o $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ ds4_bench.o $(CORE_OBJS) $(METAL_LDLIBS)
 
-cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o linenoise.o rax.o $(CPU_CORE_OBJS)
+ds4_perplexity: ds4_perplexity.o $(CORE_OBJS)
+	$(CC) $(CFLAGS) -o $@ ds4_perplexity.o $(CORE_OBJS) $(METAL_LDLIBS)
+
+cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_perplexity_cpu.o linenoise.o rax.o $(CPU_CORE_OBJS)
 	$(CC) $(CFLAGS) -o ds4 ds4_cli_cpu.o linenoise.o $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-server ds4_server_cpu.o rax.o $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-bench ds4_bench_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
+	$(CC) $(CFLAGS) -o ds4_perplexity ds4_perplexity_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
 
 cuda-regression:
 	@echo "cuda-regression requires a CUDA build"
@@ -63,10 +67,14 @@ ds4-server: ds4_server.o rax.o $(CORE_OBJS)
 ds4-bench: ds4_bench.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
-cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o linenoise.o rax.o $(CPU_CORE_OBJS)
+ds4_perplexity: ds4_perplexity.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_perplexity_cpu.o linenoise.o rax.o $(CPU_CORE_OBJS)
 	$(CC) $(CFLAGS) -o ds4 ds4_cli_cpu.o linenoise.o $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-server ds4_server_cpu.o rax.o $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-bench ds4_bench_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
+	$(CC) $(CFLAGS) -o ds4_perplexity ds4_perplexity_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
 
 cuda-regression: tests/cuda_long_context_smoke
 	./tests/cuda_long_context_smoke
@@ -86,6 +94,9 @@ ds4_server.o: ds4_server.c ds4.h rax.h
 
 ds4_bench.o: ds4_bench.c ds4.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_bench.c
+
+ds4_perplexity.o: ds4_perplexity.c ds4.h
+	$(CC) $(CFLAGS) -c -o $@ ds4_perplexity.c
 
 ds4_test.o: tests/ds4_test.c ds4_server.c ds4.h rax.h
 	$(CC) $(CFLAGS) -Wno-unused-function -c -o $@ tests/ds4_test.c
@@ -111,6 +122,9 @@ ds4_server_cpu.o: ds4_server.c ds4.h rax.h
 ds4_bench_cpu.o: ds4_bench.c ds4.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_bench.c
 
+ds4_perplexity_cpu.o: ds4_perplexity.c ds4.h
+	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_perplexity.c
+
 ds4_metal.o: ds4_metal.m ds4_gpu.h $(METAL_SRCS)
 	$(CC) $(OBJCFLAGS) -c -o $@ ds4_metal.m
 
@@ -131,4 +145,4 @@ test: ds4_test
 	./ds4_test
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4_cpu ds4_native ds4_server_test ds4_test *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f ds4 ds4-server ds4-bench ds4_perplexity ds4_cpu ds4_native ds4_server_test ds4_test *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
