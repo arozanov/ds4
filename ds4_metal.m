@@ -11369,6 +11369,41 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         return 0;
     }
 
+    /* TurboQuant cache mismatch: the indexed-mixed attention kernel reads
+     * raw_kv directly with a fp32 stride (head_dim * sizeof(float) = 2048
+     * bytes/row), but when DS4_TURBO_KV_BITS is set the raw cache stores
+     * packed turbo bytes (~352 bytes/row for 4-bit). Feeding turbo bytes
+     * into the kernel re-interprets them as fp32 garbage and corrupts
+     * attention output. The decode-mixed-batch path correctly dequants
+     * the turbo cache into a fp16 scratch buffer before flash-attention,
+     * so we route through that path here. We drop the top-k filtering
+     * (attend to all n_comp visible rows) - causal/window mask still
+     * applies. TODO: add a turbo-aware indexed kernel for full perf. */
+    if (ds4_gpu_turbo_bits_active()) {
+        DS4_TURBO_TRACE("indexed_mixed_batch -> decode_mixed_batch fallback (turbo active) n_tokens=%u n_raw=%u n_comp=%u top_k=%u",
+                        n_tokens, n_raw, n_comp, top_k);
+        return ds4_gpu_attention_decode_mixed_batch_heads_tensor(
+                heads,
+                model_map,
+                model_size,
+                sinks_offset,
+                q,
+                raw_kv,
+                comp_kv,
+                NULL,
+                0u,
+                n_tokens,
+                pos0,
+                n_raw,
+                raw_cap,
+                raw_start,
+                n_comp,
+                window,
+                ratio,
+                n_head,
+                head_dim);
+    }
+
     @autoreleasepool {
         if (sinks_offset > model_size || (uint64_t)n_head * sizeof(float) > model_size - sinks_offset) {
             fprintf(stderr, "ds4: Metal indexed attention sinks range is outside the mapped model\n");
