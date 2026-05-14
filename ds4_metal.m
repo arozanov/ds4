@@ -104,6 +104,7 @@ static id<MTLComputePipelineState> g_dsv4_compressor_store_one_pipeline;
 static id<MTLComputePipelineState> g_dsv4_sort_i32_rows_asc_pipeline;
 static id<MTLComputePipelineState> g_dsv4_indexed_attention_heads8_pipeline;
 static id<MTLComputePipelineState> g_dsv4_indexed_attention_heads8_rb4_pipeline;
+static id<MTLComputePipelineState> g_dsv4_indexed_attention_heads8_f16_pipeline;
 static id<MTLComputePipelineState> g_dsv4_softplus_sqrt_pipeline;
 static id<MTLComputePipelineState> g_dsv4_router_finalize_one_pipeline;
 static id<MTLComputePipelineState> g_dsv4_router_weights_one_pipeline;
@@ -131,6 +132,7 @@ static id<MTLBuffer> g_router_weight_sum_buffer;
 static id<MTLBuffer> g_indexer_head_scores_buffer;
 static id<MTLBuffer> g_indexer_topk_buffer;
 static id<MTLBuffer> g_indexed_topk_buffer;
+static id<MTLBuffer> g_indexed_turbo_kv_buffer;
 static id<MTLBuffer> g_f16_round_scratch_buffer;
 static id<MTLBuffer> g_raw_store_round_buffer;
 static id<MTLBuffer> g_moe_gate_scratch_buffer;
@@ -166,6 +168,7 @@ static NSUInteger g_router_weight_sum_bytes;
 static NSUInteger g_indexer_head_scores_bytes;
 static NSUInteger g_indexer_topk_bytes;
 static NSUInteger g_indexed_topk_bytes;
+static NSUInteger g_indexed_turbo_kv_bytes;
 static NSUInteger g_f16_round_scratch_bytes;
 static NSUInteger g_raw_store_round_bytes;
 static NSUInteger g_moe_gate_scratch_bytes;
@@ -1097,6 +1100,7 @@ void ds4_gpu_print_memory_report(const char *label) {
         (uint64_t)g_indexer_head_scores_bytes +
         (uint64_t)g_indexer_topk_bytes +
         (uint64_t)g_indexed_topk_bytes +
+        (uint64_t)g_indexed_turbo_kv_bytes +
         (uint64_t)g_f16_round_scratch_bytes +
         (uint64_t)g_raw_store_round_bytes +
         (uint64_t)g_moe_gate_scratch_bytes +
@@ -1140,7 +1144,8 @@ void ds4_gpu_print_memory_report(const char *label) {
                           (uint64_t)g_router_weight_sum_bytes),
             ds4_gpu_mib((uint64_t)g_indexer_head_scores_bytes +
                           (uint64_t)g_indexer_topk_bytes +
-                          (uint64_t)g_indexed_topk_bytes),
+                          (uint64_t)g_indexed_topk_bytes +
+                          (uint64_t)g_indexed_turbo_kv_bytes),
             ds4_gpu_mib((uint64_t)g_moe_gate_scratch_bytes +
                           (uint64_t)g_moe_down_scratch_bytes +
                           (uint64_t)g_moe_id_map_bytes),
@@ -3781,6 +3786,8 @@ int ds4_gpu_init(void) {
             ds4_gpu_get_pipeline("kernel_dsv4_indexed_mixed_attention_heads8");
         g_dsv4_indexed_attention_heads8_rb4_pipeline =
             ds4_gpu_get_pipeline("kernel_dsv4_indexed_mixed_attention_heads8_rb4");
+        g_dsv4_indexed_attention_heads8_f16_pipeline =
+            ds4_gpu_get_pipeline("kernel_dsv4_indexed_mixed_attention_heads8_f16");
         g_dsv4_softplus_sqrt_pipeline =
             ds4_gpu_get_pipeline("kernel_dsv4_softplus_sqrt_f32_4");
         g_dsv4_router_finalize_one_pipeline =
@@ -3794,6 +3801,7 @@ int ds4_gpu_init(void) {
             !g_dsv4_sort_i32_rows_asc_pipeline ||
             !g_dsv4_indexed_attention_heads8_pipeline ||
             !g_dsv4_indexed_attention_heads8_rb4_pipeline ||
+            !g_dsv4_indexed_attention_heads8_f16_pipeline ||
             !g_dsv4_softplus_sqrt_pipeline ||
             !g_dsv4_router_finalize_one_pipeline ||
             !g_dsv4_router_weights_one_pipeline ||
@@ -4057,6 +4065,7 @@ void ds4_gpu_cleanup(void) {
         g_dsv4_sort_i32_rows_asc_pipeline = nil;
         g_dsv4_indexed_attention_heads8_pipeline = nil;
         g_dsv4_indexed_attention_heads8_rb4_pipeline = nil;
+        g_dsv4_indexed_attention_heads8_f16_pipeline = nil;
         g_dsv4_softplus_sqrt_pipeline = nil;
         g_dsv4_router_finalize_one_pipeline = nil;
         g_dsv4_router_weights_one_pipeline = nil;
@@ -4080,6 +4089,7 @@ void ds4_gpu_cleanup(void) {
         g_indexer_head_scores_buffer = nil;
         g_indexer_topk_buffer = nil;
         g_indexed_topk_buffer = nil;
+        g_indexed_turbo_kv_buffer = nil;
         g_f16_round_scratch_buffer = nil;
         g_raw_store_round_buffer = nil;
         g_moe_gate_scratch_buffer = nil;
@@ -4111,6 +4121,7 @@ void ds4_gpu_cleanup(void) {
         g_indexer_head_scores_bytes = 0;
         g_indexer_topk_bytes = 0;
         g_indexed_topk_bytes = 0;
+        g_indexed_turbo_kv_bytes = 0;
         g_f16_round_scratch_bytes = 0;
         g_raw_store_round_bytes = 0;
         g_moe_gate_scratch_bytes = 0;
@@ -11369,40 +11380,16 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         return 0;
     }
 
-    /* TurboQuant cache mismatch: the indexed-mixed attention kernel reads
-     * raw_kv directly with a fp32 stride (head_dim * sizeof(float) = 2048
-     * bytes/row), but when DS4_TURBO_KV_BITS is set the raw cache stores
-     * packed turbo bytes (~352 bytes/row for 4-bit). Feeding turbo bytes
-     * into the kernel re-interprets them as fp32 garbage and corrupts
-     * attention output. The decode-mixed-batch path correctly dequants
-     * the turbo cache into a fp16 scratch buffer before flash-attention,
-     * so we route through that path here. We drop the top-k filtering
-     * (attend to all n_comp visible rows) - causal/window mask still
-     * applies. TODO: add a turbo-aware indexed kernel for full perf. */
-    if (ds4_gpu_turbo_bits_active()) {
-        DS4_TURBO_TRACE("indexed_mixed_batch -> decode_mixed_batch fallback (turbo active) n_tokens=%u n_raw=%u n_comp=%u top_k=%u",
-                        n_tokens, n_raw, n_comp, top_k);
-        return ds4_gpu_attention_decode_mixed_batch_heads_tensor(
-                heads,
-                model_map,
-                model_size,
-                sinks_offset,
-                q,
-                raw_kv,
-                comp_kv,
-                NULL,
-                0u,
-                n_tokens,
-                pos0,
-                n_raw,
-                raw_cap,
-                raw_start,
-                n_comp,
-                window,
-                ratio,
-                n_head,
-                head_dim);
-    }
+    /* TurboQuant fast path: the raw cache holds packed turbo bytes
+     * (~352 / 416 B per row), so the f32 indexed kernel cannot read it
+     * directly. We pre-dequantize the n_raw active rows into a dense
+     * fp16 scratch buffer (1024 B/row, ring rotation handled by the
+     * dequant helper) and dispatch the fp16 variant of the indexed
+     * kernel. The scratch packs rows from logical 0, so passing
+     * raw_start = 0 and raw_cap = n_raw makes the kernel's modulo
+     * indexing collapse to `logical`. Top-k filtering on comp_kv is
+     * preserved (comp_kv stays fp32 under turbo). */
+    const int turbo_bits = ds4_gpu_turbo_bits_active();
 
     @autoreleasepool {
         if (sinks_offset > model_size || (uint64_t)n_head * sizeof(float) > model_size - sinks_offset) {
@@ -11411,8 +11398,13 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         }
 
         const uint64_t row_bytes = (uint64_t)head_dim * sizeof(float);
+        const uint64_t half_row_bytes = (uint64_t)head_dim * sizeof(uint16_t);
         const uint64_t q_bytes = (uint64_t)n_tokens * n_head * row_bytes;
-        const uint64_t raw_bytes = (uint64_t)raw_cap * row_bytes;
+        /* raw cache size: under turbo it's packed bytes, otherwise fp32 rows. */
+        const size_t turbo_row_bytes = turbo_bits ? ds4_gpu_turbo_row_bytes_512(turbo_bits) : 0u;
+        const uint64_t raw_bytes = turbo_bits ?
+            (uint64_t)raw_cap * (uint64_t)turbo_row_bytes :
+            (uint64_t)raw_cap * row_bytes;
         const uint64_t comp_bytes = (uint64_t)n_comp * row_bytes;
         const uint64_t topk_bytes = (uint64_t)top_k * n_tokens * sizeof(int32_t);
         id<MTLBuffer> qbuf = ds4_gpu_tensor_buffer(q);
@@ -11441,12 +11433,17 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
             ds4_gpu_hot_pipeline(g_dsv4_sort_i32_rows_asc_pipeline,
                                     "kernel_dsv4_sort_i32_rows_asc");
         const bool decode_one_token = n_tokens == 1u;
+        /* Turbo always uses the fp16 variant: the rb4 specialization has no
+         * fp16 sibling and the perf goal is prefill anyway. */
         id<MTLComputePipelineState> attn_pipeline =
-            decode_one_token ?
-            ds4_gpu_hot_pipeline(g_dsv4_indexed_attention_heads8_rb4_pipeline,
-                                   "kernel_dsv4_indexed_mixed_attention_heads8_rb4") :
-            ds4_gpu_hot_pipeline(g_dsv4_indexed_attention_heads8_pipeline,
-                                   "kernel_dsv4_indexed_mixed_attention_heads8");
+            turbo_bits ?
+            ds4_gpu_hot_pipeline(g_dsv4_indexed_attention_heads8_f16_pipeline,
+                                   "kernel_dsv4_indexed_mixed_attention_heads8_f16") :
+            (decode_one_token ?
+             ds4_gpu_hot_pipeline(g_dsv4_indexed_attention_heads8_rb4_pipeline,
+                                    "kernel_dsv4_indexed_mixed_attention_heads8_rb4") :
+             ds4_gpu_hot_pipeline(g_dsv4_indexed_attention_heads8_pipeline,
+                                    "kernel_dsv4_indexed_mixed_attention_heads8"));
         if (!sort_pipeline || !attn_pipeline) return 0;
         if ((NSUInteger)top_k > sort_pipeline.maxTotalThreadsPerThreadgroup) {
             fprintf(stderr, "ds4: Metal indexed attention top-k exceeds sort threadgroup limit\n");
@@ -11456,6 +11453,8 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
          * Fast decode attends to the same full top-k compressed rows but keeps
          * them in score order, avoiding a chronological sort dispatch.
          * --quality restores the sorted order for stricter reproducibility.
+         * The rb4 path is gated behind !turbo_bits since turbo routes through
+         * the non-rb4 fp16 kernel; we still skip the sort to match decode.
          */
         const bool skip_decode_sort = !g_quality_mode && decode_one_token;
         if (!skip_decode_sort &&
@@ -11464,6 +11463,19 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                                              (NSUInteger)topk_bytes,
                                              "ds4_indexed_topk_sorted")) {
             return 0;
+        }
+
+        /* Allocate the per-call fp16 dequant scratch (raw_cap rows worth
+         * is the lifetime worst case; we only fill n_raw rows). The
+         * scratch is grown lazily and reused across layers/sessions. */
+        if (turbo_bits) {
+            const NSUInteger scratch_bytes = (NSUInteger)raw_cap * (NSUInteger)half_row_bytes;
+            if (!ds4_gpu_ensure_scratch_buffer(&g_indexed_turbo_kv_buffer,
+                                                 &g_indexed_turbo_kv_bytes,
+                                                 scratch_bytes,
+                                                 "ds4_indexed_turbo_kv_f16")) {
+                return 0;
+            }
         }
 
         ds4_gpu_dsv4_topk_mask_args sort_args = {
@@ -11476,12 +11488,16 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
             .nb0 = sizeof(int32_t),
             .nb1 = (uint64_t)top_k * sizeof(int32_t),
         };
+        /* For turbo, the scratch packs n_raw rows densely at logical 0, so
+         * we pass raw_start = 0 and raw_cap = n_raw to make the kernel's
+         * `(raw_start + logical) % raw_cap` indexing yield `logical`.
+         * raw_row_stride switches to half-row bytes. */
         ds4_gpu_dsv4_indexed_attention_args attn_args = {
             .n_tokens = n_tokens,
             .n_head = n_head,
             .n_raw = n_raw,
-            .raw_cap = raw_cap,
-            .raw_start = raw_start,
+            .raw_cap = turbo_bits ? n_raw : raw_cap,
+            .raw_start = turbo_bits ? 0u : raw_start,
             .n_comp = n_comp,
             .top_k = top_k,
             .pos0 = pos0,
@@ -11489,7 +11505,7 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
             .ratio = ratio,
             .q_token_stride = (uint64_t)n_head * row_bytes,
             .q_head_stride = row_bytes,
-            .raw_row_stride = row_bytes,
+            .raw_row_stride = turbo_bits ? half_row_bytes : row_bytes,
             .comp_row_stride = row_bytes,
             .topk_token_stride = (uint64_t)top_k * sizeof(int32_t),
             .dst_token_stride = (uint64_t)n_head * row_bytes,
@@ -11500,6 +11516,25 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
         if (!cb) return 0;
+
+        /* Pre-dequant the active turbo rows into the fp16 scratch. The
+         * helper handles ring rotation (raw_start + n_raw > raw_cap) and
+         * the fp16 RoPE tail overlay, producing rows that match the CPU
+         * KV layout bit-for-bit. */
+        if (turbo_bits) {
+            DS4_TURBO_TRACE("indexed_mixed_batch turbo path n_tokens=%u n_raw=%u raw_cap=%u raw_start=%u n_comp=%u top_k=%u bits=%d",
+                            n_tokens, n_raw, raw_cap, raw_start, n_comp, top_k, turbo_bits);
+            if (!ds4_gpu_encode_turbo_dequant_to_kv_scratch(cb,
+                                                              raw_kv,
+                                                              g_indexed_turbo_kv_buffer,
+                                                              0,
+                                                              raw_cap,
+                                                              raw_start,
+                                                              n_raw,
+                                                              turbo_bits)) {
+                return 0;
+            }
+        }
 
         id<MTLComputeCommandEncoder> enc = nil;
         if (!skip_decode_sort) {
@@ -11518,14 +11553,21 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         [enc setComputePipelineState:attn_pipeline];
         [enc setBytes:&attn_args length:sizeof(attn_args) atIndex:0];
         [enc setBuffer:qbuf offset:ds4_gpu_tensor_offset(q) atIndex:1];
-        [enc setBuffer:rawbuf offset:ds4_gpu_tensor_offset(raw_kv) atIndex:2];
+        if (turbo_bits) {
+            [enc setBuffer:g_indexed_turbo_kv_buffer offset:0 atIndex:2];
+        } else {
+            [enc setBuffer:rawbuf offset:ds4_gpu_tensor_offset(raw_kv) atIndex:2];
+        }
         [enc setBuffer:compbuf offset:ds4_gpu_tensor_offset(comp_kv) atIndex:3];
         [enc setBuffer:skip_decode_sort ? topkbuf : g_indexed_topk_buffer
               offset:skip_decode_sort ? ds4_gpu_tensor_offset(topk) : 0
              atIndex:4];
         [enc setBuffer:sinks_buf offset:(NSUInteger)sinks_inner atIndex:5];
         [enc setBuffer:headsbuf offset:ds4_gpu_tensor_offset(heads) atIndex:6];
-        [enc setThreadgroupMemoryLength:(decode_one_token ? 4u : 1u) * 128u * 4u * sizeof(float)
+        /* The f16 and non-rb4 f32 kernels both stage a single 128-wide row
+         * in shared memory; only the rb4 specialization needs 4x the slot. */
+        const bool use_rb4_layout = !turbo_bits && decode_one_token;
+        [enc setThreadgroupMemoryLength:(use_rb4_layout ? 4u : 1u) * 128u * 4u * sizeof(float)
                                 atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_tokens, ((NSUInteger)n_head + 7u) / 8u, 1)
              threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];

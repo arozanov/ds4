@@ -591,6 +591,119 @@ kernel void kernel_dsv4_indexed_mixed_attention_heads8(
     dst4[lane + 96] = o3 * inv_s;
 }
 
+// f16 variant of kernel_dsv4_indexed_mixed_attention_heads8.
+//
+// Used by the TurboQuant KV cache path: the raw cache stores packed turbo
+// bytes (~352 B / 416 B per row), so callers pre-dequantize it into a dense
+// fp16 scratch buffer (one row = head_dim halves = 1024 B) and pass that as
+// `raw_kv`. Row indexing is also simplified: the scratch packs rows
+// contiguously starting at logical 0, so the caller passes raw_start = 0
+// and raw_cap = n_raw, making `(raw_start + logical) % raw_cap` collapse
+// to `logical`.
+//
+// comp_kv is unchanged (compressor cache stays fp32) and the top-k filter
+// applies as in the f32 variant: only the local raw scan switches to fp16.
+kernel void kernel_dsv4_indexed_mixed_attention_heads8_f16(
+        constant ds4_metal_args_dsv4_indexed_attention & args,
+        device const char *q,
+        device const char *raw_kv,
+        device const char *comp_kv,
+        device const char *topk,
+        device const char *sinks,
+        device       char *dst,
+        threadgroup float4 *kv_shared [[threadgroup(0)]],
+        uint2  tgpig [[threadgroup_position_in_grid]],
+        ushort tid   [[thread_index_in_threadgroup]],
+        ushort lane  [[thread_index_in_simdgroup]],
+        ushort sg    [[simdgroup_index_in_threadgroup]]) {
+    const uint token = tgpig.x;
+    const uint head = tgpig.y * 8u + (uint)sg;
+    if (token >= args.n_tokens || head >= args.n_head) {
+        return;
+    }
+
+    device const float4 *q4 = (device const float4 *)(q +
+        (uint64_t)token * args.q_token_stride +
+        (uint64_t)head  * args.q_head_stride);
+    const half4 q0 = (half4)q4[lane +  0];
+    const half4 q1 = (half4)q4[lane + 32];
+    const half4 q2 = (half4)q4[lane + 64];
+    const half4 q3 = (half4)q4[lane + 96];
+
+    float M = -FLT_MAX/2.0f;
+    float S = 0.0f;
+    float4 o0 = 0.0f;
+    float4 o1 = 0.0f;
+    float4 o2 = 0.0f;
+    float4 o3 = 0.0f;
+
+    const uint qpos = args.pos0 + token;
+    const uint last_pos = args.pos0 + args.n_tokens - 1u;
+    const uint first_raw_pos = last_pos + 1u - args.n_raw;
+    const uint raw_last_pos = first_raw_pos + args.n_raw - 1u;
+    const uint window_first = (args.window != 0u && qpos + 1u > args.window) ?
+        qpos + 1u - args.window : 0u;
+    uint first = max(first_raw_pos, window_first);
+    uint last = min(qpos, raw_last_pos);
+
+    if (first <= last) {
+        for (uint pos = first; pos <= last; pos++) {
+            const uint logical = pos - first_raw_pos;
+            const uint row = (args.raw_start + logical) % args.raw_cap;
+            device const half4 *src = (device const half4 *)(raw_kv +
+                (uint64_t)row * args.raw_row_stride);
+            // Promote half4 -> float4 on store so the shared layout matches
+            // the f32 helper. K read bandwidth is halved vs the f32 kernel;
+            // the helper still casts to half4 internally for the dot/value.
+            if (tid < 128) kv_shared[tid] = (float4)src[tid];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            dsv4_attend_shared_f32_row_as_f16(kv_shared,
+                                              q0, q1, q2, q3,
+                                              args.scale,
+                                              lane,
+                                              M, S,
+                                              o0, o1, o2, o3);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    uint visible = (qpos + 1u) / args.ratio;
+    visible = min(visible, args.n_comp);
+    device const int32_t *row_topk = (device const int32_t *)(topk +
+        (uint64_t)token * args.topk_token_stride);
+    for (uint i = 0; i < args.top_k; i++) {
+        const int32_t idx = row_topk[i];
+        if (idx < 0) {
+            continue;
+        }
+        if ((uint)idx >= visible) {
+            break;
+        }
+        device const float4 *src = (device const float4 *)(comp_kv +
+            (uint64_t)(uint)idx * args.comp_row_stride);
+        if (tid < 128) kv_shared[tid] = src[tid];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        dsv4_attend_shared_f32_row_as_f16(kv_shared,
+                                          q0, q1, q2, q3,
+                                          args.scale,
+                                          lane,
+                                          M, S,
+                                          o0, o1, o2, o3);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    dsv4_attend_sink(((device const float *)sinks)[head], M, S, o0, o1, o2, o3);
+
+    const float inv_s = S == 0.0f ? 0.0f : 1.0f/S;
+    device float4 *dst4 = (device float4 *)(dst +
+        (uint64_t)token * args.dst_token_stride +
+        (uint64_t)head  * args.dst_head_stride);
+    dst4[lane +  0] = o0 * inv_s;
+    dst4[lane + 32] = o1 * inv_s;
+    dst4[lane + 64] = o2 * inv_s;
+    dst4[lane + 96] = o3 * inv_s;
+}
+
 // Decode specialization of kernel_dsv4_indexed_mixed_attention_heads8.
 // Generation attends one token at a time, so the ratio-4 indexed path spends a
 // visible amount of time repeatedly staging the same K/V row for the eight
