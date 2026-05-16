@@ -12,3 +12,9 @@
 /misc/
 .*.swp
 .DS_Store
+
+# Test binaries
+ds4_perplexity
+tests/test_turbo
+tests/test_turbo_metal
+.gitignore_add

@@ -36,6 +36,7 @@ typedef struct {
     double step_mul;
     bool warm_weights;
     bool quality;
+    bool allow_upstream_names;
 } bench_config;
 
 static double bench_now_sec(void) {
@@ -68,6 +69,7 @@ static void usage(FILE *fp) {
         "  -t, --threads N        CPU helper threads.\n"
         "  --quality              Prefer exact kernels where applicable.\n"
         "  --warm-weights         Touch mapped tensor pages before benchmarking.\n"
+        "  --allow-upstream-names Accept GGUFs with upstream llama.cpp DeepSeek-V4 tensor naming.\n"
         "\n"
         "Sweep:\n"
         "  --ctx-start N          First measured frontier. Default: 2048\n"
@@ -221,6 +223,8 @@ static bench_config parse_options(int argc, char **argv) {
             c.quality = true;
         } else if (!strcmp(arg, "--warm-weights")) {
             c.warm_weights = true;
+        } else if (!strcmp(arg, "--allow-upstream-names")) {
+            c.allow_upstream_names = true;
         } else {
             fprintf(stderr, "ds4-bench: unknown option: %s\n", arg);
             usage(stderr);
@@ -293,6 +297,7 @@ int main(int argc, char **argv) {
         .n_threads = cfg.threads,
         .warm_weights = cfg.warm_weights,
         .quality = cfg.quality,
+        .allow_upstream_names = cfg.allow_upstream_names,
     };
     ds4_engine *engine = NULL;
     if (ds4_engine_open(&engine, &opt) != 0) return 1;

@@ -90,6 +90,7 @@ typedef struct {
     bool warm_weights;
     bool quality;
     bool quiet;
+    bool allow_upstream_names;
 } ppl_config;
 
 static double ppl_now_sec(void) {
@@ -115,6 +116,7 @@ static void usage(FILE *fp) {
         "  -t, --threads N        CPU helper threads.\n"
         "  --quality              Prefer exact kernels where applicable.\n"
         "  --warm-weights         Touch mapped tensor pages before measuring.\n"
+        "  --allow-upstream-names Accept GGUFs with upstream llama.cpp DeepSeek-V4 tensor naming.\n"
         "  --quiet                Suppress per-progress logging.\n"
         "  -h, --help             Show this help.\n");
 }
@@ -205,6 +207,8 @@ static ppl_config parse_options(int argc, char **argv) {
             c.quality = true;
         } else if (!strcmp(arg, "--warm-weights")) {
             c.warm_weights = true;
+        } else if (!strcmp(arg, "--allow-upstream-names")) {
+            c.allow_upstream_names = true;
         } else if (!strcmp(arg, "--quiet")) {
             c.quiet = true;
         } else {
@@ -232,6 +236,7 @@ int main(int argc, char **argv) {
         .n_threads = cfg.threads,
         .warm_weights = cfg.warm_weights,
         .quality = cfg.quality,
+        .allow_upstream_names = cfg.allow_upstream_names,
     };
     ds4_engine *engine = NULL;
     if (ds4_engine_open(&engine, &opt) != 0) return 1;

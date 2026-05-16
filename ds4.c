@@ -136,9 +136,11 @@ static int g_ds4_lock_fd = -1;
  *   - Q2_K routed down experts
  *   - Q4_K routed experts in the high-memory variant
  *   - IQ2_XXS routed gate/up experts
+ *   - Q8_0 routed experts in the pure-Q8 variant
  *   - Q8_K temporary activation blocks for dot products
  */
 #define QK_K 256
+#define QK8_0 32
 
 typedef struct {
     uint8_t  scales[QK_K / 16];
@@ -165,10 +167,17 @@ typedef struct {
     uint16_t qs[QK_K / 8];
 } block_iq2_xxs;
 
+/* Q8_0: one f16 scale + 32 int8 quants per block. */
+typedef struct {
+    uint16_t d;
+    int8_t   qs[QK8_0];
+} block_q8_0;
+
 #define DS4_STATIC_ASSERT(name, cond) typedef char name[(cond) ? 1 : -1]
 DS4_STATIC_ASSERT(ds4_block_q2_k_size, sizeof(block_q2_K) == 84);
 DS4_STATIC_ASSERT(ds4_block_q4_k_size, sizeof(block_q4_K) == 144);
 DS4_STATIC_ASSERT(ds4_block_q8_k_size, sizeof(block_q8_K) == 292);
+DS4_STATIC_ASSERT(ds4_block_q8_0_size, sizeof(block_q8_0) == 34);
 DS4_STATIC_ASSERT(ds4_block_iq2_xxs_size, sizeof(block_iq2_xxs) == 66);
 
 typedef struct {
@@ -936,6 +945,12 @@ typedef struct {
 
     ds4_kv *kv;
     ds4_tensor *tensors;
+
+    /* Optional owned storage for tensor names rewritten at load time.  The
+     * mmap-backed default names live in the mapped file; rewritten names are
+     * allocated here and freed at model_close().  Entries are NULL unless a
+     * rename happened for that tensor. */
+    char **owned_names;
 } ds4_model;
 
 static uint64_t scalar_value_size(uint32_t type) {
@@ -1089,6 +1104,10 @@ static void model_close(ds4_model *m) {
     if (!m) return;
     free(m->kv);
     free(m->tensors);
+    if (m->owned_names) {
+        for (uint64_t i = 0; i < m->n_tensors; i++) free(m->owned_names[i]);
+        free(m->owned_names);
+    }
     if (m->map) munmap((void *)m->map, (size_t)m->size);
     if (m->fd >= 0) close(m->fd);
     memset(m, 0, sizeof(*m));
@@ -1200,12 +1219,171 @@ static void parse_tensors(ds4_model *m, ds4_cursor *c) {
     }
 }
 
+/* Bidirectional name map between the DS4 GGUF tensor names this loader expects
+ * and the upstream llama.cpp / HF DeepSeek-V4 names used by externally produced
+ * GGUFs (e.g. the Preyazz Q8 build).  The DS4 side is the canonical name used
+ * everywhere else in this file; the HF side is what we may see inside a foreign
+ * GGUF.  This table mirrors the forward map in gguf-tools/deepseek4-quantize.c.
+ *
+ * Entries marked "with .weight" expect the .weight suffix to be present in the
+ * GGUF; entries marked otherwise do not carry a .weight suffix on the HF side.
+ * We handle both shapes in remap_upstream_tensor_name(). */
+typedef struct {
+    const char *ds4;
+    const char *hf;
+} ds4_name_pair;
+
+static const ds4_name_pair k_top_name_map[] = {
+    { "token_embd.weight",      "embed.weight" },
+    { "output_norm.weight",     "norm.weight" },
+    { "output.weight",          "head.weight" },
+    { "output_hc_base.weight",  "hc_head_base" },
+    { "output_hc_fn.weight",    "hc_head_fn" },
+    { "output_hc_scale.weight", "hc_head_scale" },
+};
+
+static const ds4_name_pair k_layer_name_map[] = {
+    { "hc_attn_base.weight",              "hc_attn_base" },
+    { "hc_attn_fn.weight",                "hc_attn_fn" },
+    { "hc_attn_scale.weight",             "hc_attn_scale" },
+    { "hc_ffn_base.weight",               "hc_ffn_base" },
+    { "hc_ffn_fn.weight",                 "hc_ffn_fn" },
+    { "hc_ffn_scale.weight",              "hc_ffn_scale" },
+    { "attn_sinks.weight",                "attn.attn_sink" },
+    { "attn_q_a.weight",                  "attn.wq_a.weight" },
+    { "attn_q_b.weight",                  "attn.wq_b.weight" },
+    { "attn_q_a_norm.weight",             "attn.q_norm.weight" },
+    { "attn_kv.weight",                   "attn.wkv.weight" },
+    { "attn_kv_a_norm.weight",            "attn.kv_norm.weight" },
+    { "attn_output_a.weight",             "attn.wo_a.weight" },
+    { "attn_output_b.weight",             "attn.wo_b.weight" },
+    { "attn_compressor_ape.weight",       "attn.compressor.ape" },
+    { "attn_compressor_kv.weight",        "attn.compressor.wkv.weight" },
+    { "attn_compressor_gate.weight",      "attn.compressor.wgate.weight" },
+    { "attn_compressor_norm.weight",      "attn.compressor.norm.weight" },
+    { "indexer.attn_q_b.weight",          "attn.indexer.wq_b.weight" },
+    { "indexer.proj.weight",              "attn.indexer.weights_proj.weight" },
+    { "indexer_compressor_ape.weight",    "attn.indexer.compressor.ape" },
+    { "indexer_compressor_kv.weight",     "attn.indexer.compressor.wkv.weight" },
+    { "indexer_compressor_gate.weight",   "attn.indexer.compressor.wgate.weight" },
+    { "indexer_compressor_norm.weight",   "attn.indexer.compressor.norm.weight" },
+    { "attn_norm.weight",                 "attn_norm.weight" },
+    { "ffn_norm.weight",                  "ffn_norm.weight" },
+    { "ffn_gate_shexp.weight",            "ffn.shared_experts.w1.weight" },
+    { "ffn_up_shexp.weight",              "ffn.shared_experts.w3.weight" },
+    { "ffn_down_shexp.weight",            "ffn.shared_experts.w2.weight" },
+    { "ffn_gate_inp.weight",              "ffn.gate.weight" },
+    { "exp_probs_b.bias",                 "ffn.gate.bias" },
+    { "ffn_gate_tid2eid.weight",          "ffn.gate.tid2eid" },
+};
+
+/* Routed-expert tensors land in HF GGUFs as one tensor per expert and may use
+ * either "ffn.experts.<eid>.w{1,2,3}.weight" or the older
+ * "ffn.experts.w{1,2,3}.weight" layout.  ds4 expects a single 3D tensor named
+ * blk.<L>.ffn_{gate,down,up}_exps.weight.  Per-expert split tensors are a
+ * different topology and cannot be remapped by a simple table; if we see them
+ * the user has the wrong GGUF for this build and we say so. */
+static const char *expert_part_hf_name(const char *ds4_kind) {
+    if (strcmp(ds4_kind, "gate") == 0) return "w1";
+    if (strcmp(ds4_kind, "down") == 0) return "w2";
+    if (strcmp(ds4_kind, "up")   == 0) return "w3";
+    return NULL;
+}
+
+/* Try to rewrite a single GGUF tensor name from the upstream/HF flavor into the
+ * DS4 GGUF flavor.  Returns a newly-allocated string on success, or NULL when
+ * the name is already in DS4 form (or simply does not match anything we know).
+ * The caller decides what to do with unmapped names. */
+static char *remap_upstream_tensor_name(const char *name) {
+    /* Top-level (non-layer) tensors. */
+    for (size_t i = 0; i < sizeof(k_top_name_map) / sizeof(k_top_name_map[0]); i++) {
+        if (strcmp(name, k_top_name_map[i].hf) == 0) {
+            return ds4_strdup(k_top_name_map[i].ds4);
+        }
+    }
+
+    /* Layer tensors: "layers.<L>.<rest>" -> "blk.<L>.<rest>" with sub-name remap. */
+    int layer = -1;
+    int prefix_len = 0;
+    if (sscanf(name, "layers.%d.%n", &layer, &prefix_len) == 1 && prefix_len > 0) {
+        const char *rest = name + prefix_len;
+
+        /* Routed-expert split shape: "ffn.experts(.\d+)?.w[123].weight". */
+        if (strncmp(rest, "ffn.experts.", 12) == 0) {
+            ds4_die("model GGUF uses split per-expert routed tensors which "
+                    "this build does not load; please use a stacked 3D experts GGUF");
+        }
+
+        for (size_t i = 0; i < sizeof(k_layer_name_map) / sizeof(k_layer_name_map[0]); i++) {
+            if (strcmp(rest, k_layer_name_map[i].hf) == 0) {
+                char buf[256];
+                int n = snprintf(buf, sizeof(buf), "blk.%d.%s", layer, k_layer_name_map[i].ds4);
+                if (n < 0 || (size_t)n >= sizeof(buf)) ds4_die("remapped tensor name is too long");
+                return ds4_strdup(buf);
+            }
+        }
+
+        /* Stacked routed experts: "ffn.experts.w1.weight" was already handled
+         * above as the split form.  The HF stacked form (if it exists) would
+         * look identical to the DS4 form modulo the layer prefix. */
+        const char *expert_kinds[] = { "gate", "down", "up" };
+        for (size_t k = 0; k < 3; k++) {
+            char hf_stacked[64];
+            snprintf(hf_stacked, sizeof(hf_stacked),
+                     "ffn.experts.%s.weight", expert_part_hf_name(expert_kinds[k]));
+            if (strcmp(rest, hf_stacked) == 0) {
+                char buf[256];
+                snprintf(buf, sizeof(buf),
+                         "blk.%d.ffn_%s_exps.weight", layer, expert_kinds[k]);
+                return ds4_strdup(buf);
+            }
+        }
+    }
+
+    return NULL;
+}
+
+/* Apply remap_upstream_tensor_name() to every tensor that looks like it uses
+ * the upstream flavor.  Tensors that are already in DS4 form are kept as-is.
+ * This is only called when the caller explicitly opts in. */
+static void model_remap_upstream_names(ds4_model *m) {
+    if (!m->n_tensors) return;
+    m->owned_names = xcalloc((size_t)m->n_tensors, sizeof(m->owned_names[0]));
+
+    uint64_t renamed = 0;
+    for (uint64_t i = 0; i < m->n_tensors; i++) {
+        ds4_tensor *t = &m->tensors[i];
+        /* Build a NUL-terminated copy of the name for strcmp().  GGUF names are
+         * UTF-8 byte strings without a NUL in the file, so we cannot pass
+         * t->name.ptr directly. */
+        char nbuf[256];
+        if (t->name.len >= sizeof(nbuf)) continue;
+        memcpy(nbuf, t->name.ptr, (size_t)t->name.len);
+        nbuf[t->name.len] = '\0';
+
+        char *mapped = remap_upstream_tensor_name(nbuf);
+        if (!mapped) continue;
+
+        m->owned_names[i] = mapped;
+        t->name.ptr = mapped;
+        t->name.len = strlen(mapped);
+        renamed++;
+    }
+    if (renamed > 0) {
+        fprintf(stderr,
+                "ds4: --allow-upstream-names: remapped %" PRIu64 " of %" PRIu64 " tensor names\n",
+                renamed, m->n_tensors);
+    }
+}
+
 /* Open and map the GGUF once.  Metal needs a shared mapping for no-copy
  * MTLBuffers; CPU uses a private read-only mapping to avoid Darwin VM stress.
  * Tokenizer-only callers pass prefetch_cpu=false so inspecting tokens never
- * walks the huge tensor payload. */
+ * walks the huge tensor payload.  When allow_upstream_names is true, tensor
+ * names are rewritten in place from the upstream llama.cpp / HF DeepSeek-V4
+ * naming flavor into the DS4 GGUF flavor this loader expects. */
 static void model_open(ds4_model *m, const char *path, bool metal_mapping,
-                       bool prefetch_cpu) {
+                       bool prefetch_cpu, bool allow_upstream_names) {
     memset(m, 0, sizeof(*m));
     m->fd = -1;
 
@@ -1248,6 +1426,8 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
 
     parse_metadata(m, &c);
     parse_tensors(m, &c);
+
+    if (allow_upstream_names) model_remap_upstream_names(m);
 
     if (!metal_mapping && prefetch_cpu) model_prefetch_cpu_mapping(m);
 }
@@ -2234,7 +2414,8 @@ static void tensor_expect_plain_layout(
 static bool tensor_is_routed_expert_type(uint32_t type) {
     return type == DS4_TENSOR_IQ2_XXS ||
            type == DS4_TENSOR_Q2_K ||
-           type == DS4_TENSOR_Q4_K;
+           type == DS4_TENSOR_Q4_K ||
+           type == DS4_TENSOR_Q8_0;
 }
 
 static DS4_MAYBE_UNUSED uint64_t routed_expert_block_bytes(uint32_t type) {
@@ -2242,14 +2423,19 @@ static DS4_MAYBE_UNUSED uint64_t routed_expert_block_bytes(uint32_t type) {
     case DS4_TENSOR_IQ2_XXS: return sizeof(block_iq2_xxs);
     case DS4_TENSOR_Q2_K:    return sizeof(block_q2_K);
     case DS4_TENSOR_Q4_K:    return sizeof(block_q4_K);
+    case DS4_TENSOR_Q8_0:    return sizeof(block_q8_0);
     default:                 ds4_die("unsupported routed expert tensor type");
     }
     return 0;
 }
 
+/* Block size differs across types: K-quants and IQ2 use QK_K = 256 elements per
+ * block, while Q8_0 uses QK8_0 = 32. Row bytes are blocks * block-size, with
+ * the divisor chosen per type. */
 static DS4_MAYBE_UNUSED uint64_t routed_expert_row_bytes(const ds4_tensor *t) {
-    if ((t->dim[0] % QK_K) != 0) ds4_die("routed expert row is not QK_K aligned");
-    return (t->dim[0] / QK_K) * routed_expert_block_bytes(t->type);
+    const uint64_t block_elems = (t->type == DS4_TENSOR_Q8_0) ? QK8_0 : QK_K;
+    if ((t->dim[0] % block_elems) != 0) ds4_die("routed expert row is not block aligned");
+    return (t->dim[0] / block_elems) * routed_expert_block_bytes(t->type);
 }
 
 static void tensor_expect_routed_expert(
@@ -16110,7 +16296,11 @@ int ds4_engine_routed_quant_bits(ds4_engine *e) {
     if (!e) return 0;
     const ds4_tensor *gate = e->weights.layer[0].ffn_gate_exps;
     if (!gate) return 0;
-    return gate->type == DS4_TENSOR_Q4_K ? 4 : 2;
+    switch (gate->type) {
+    case DS4_TENSOR_Q8_0: return 8;
+    case DS4_TENSOR_Q4_K: return 4;
+    default:              return 2;
+    }
 }
 
 bool ds4_engine_has_mtp(ds4_engine *e) {
@@ -16922,7 +17112,9 @@ int ds4_dump_text_tokenization(const char *model_path, const char *text, FILE *f
     token_vec tokens = {0};
 
     if (!fp) fp = stdout;
-    model_open(&model, model_path, false, false);
+    /* Tokenizer-only path: we never touch tensor names so the upstream-name
+     * remap is unnecessary here. */
+    model_open(&model, model_path, false, false, false);
     vocab_load(&vocab, &model);
     tokenize_rendered_chat_vocab(&vocab, text ? text : "", &tokens);
 
@@ -17377,7 +17569,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     ds4_acquire_instance_lock();
 
     const bool graph_backend = ds4_backend_uses_graph(opt->backend);
-    model_open(&e->model, opt->model_path, graph_backend, true);
+    model_open(&e->model, opt->model_path, graph_backend, true, opt->allow_upstream_names);
     if (opt->warm_weights) model_warm_weights(&e->model);
     vocab_load(&e->vocab, &e->model);
     config_validate_model(&e->model);
@@ -17388,7 +17580,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         return 1;
     }
     if (opt->mtp_path && opt->mtp_path[0]) {
-        model_open(&e->mtp_model, opt->mtp_path, graph_backend, true);
+        model_open(&e->mtp_model, opt->mtp_path, graph_backend, true, opt->allow_upstream_names);
         mtp_weights_bind(&e->mtp_weights, &e->mtp_model);
         e->mtp_ready = true;
         fprintf(stderr, "ds4: MTP support model loaded: %s (draft=%d)\n",
