@@ -951,6 +951,12 @@ typedef struct {
      * allocated here and freed at model_close().  Entries are NULL unless a
      * rename happened for that tensor. */
     char **owned_names;
+
+    /* Same idea for metadata keys.  When --allow-upstream-names is used we may
+     * rewrite the "deepseekv4." prefix to "deepseek4." in place so that the
+     * rest of the loader can look up keys with its canonical names.  Entries
+     * are NULL unless that KV record was renamed. */
+    char **owned_kv_keys;
 } ds4_model;
 
 static uint64_t scalar_value_size(uint32_t type) {
@@ -1107,6 +1113,10 @@ static void model_close(ds4_model *m) {
     if (m->owned_names) {
         for (uint64_t i = 0; i < m->n_tensors; i++) free(m->owned_names[i]);
         free(m->owned_names);
+    }
+    if (m->owned_kv_keys) {
+        for (uint64_t i = 0; i < m->n_kv; i++) free(m->owned_kv_keys[i]);
+        free(m->owned_kv_keys);
     }
     if (m->map) munmap((void *)m->map, (size_t)m->size);
     if (m->fd >= 0) close(m->fd);
@@ -1343,6 +1353,50 @@ static char *remap_upstream_tensor_name(const char *name) {
     return NULL;
 }
 
+/* Upstream/HF llama.cpp uses the architecture string "deepseekv4" while the
+ * DS4 GGUF flavor uses "deepseek4".  All architecture-scoped metadata keys
+ * therefore carry one of these two prefixes ("<arch>.attention.kv_lora_rank"
+ * etc.) and the only difference is the prefix itself.  Rewrite the prefix on
+ * any KV record that uses the upstream form so the rest of the loader can
+ * look up keys with their canonical DS4 names.  Returns the number of keys
+ * that were renamed. */
+#define DS4_UPSTREAM_KV_PREFIX     "deepseekv4."
+#define DS4_UPSTREAM_KV_PREFIX_LEN (sizeof(DS4_UPSTREAM_KV_PREFIX) - 1)
+#define DS4_NATIVE_KV_PREFIX       "deepseek4."
+#define DS4_NATIVE_KV_PREFIX_LEN   (sizeof(DS4_NATIVE_KV_PREFIX) - 1)
+
+static void model_remap_upstream_kv_keys(ds4_model *m) {
+    if (!m->n_kv) return;
+    m->owned_kv_keys = xcalloc((size_t)m->n_kv, sizeof(m->owned_kv_keys[0]));
+
+    uint64_t renamed = 0;
+    for (uint64_t i = 0; i < m->n_kv; i++) {
+        ds4_kv *kv = &m->kv[i];
+        if (kv->key.len <= DS4_UPSTREAM_KV_PREFIX_LEN) continue;
+        if (memcmp(kv->key.ptr, DS4_UPSTREAM_KV_PREFIX,
+                   DS4_UPSTREAM_KV_PREFIX_LEN) != 0) continue;
+
+        const uint64_t tail_len = kv->key.len - DS4_UPSTREAM_KV_PREFIX_LEN;
+        const uint64_t new_len = DS4_NATIVE_KV_PREFIX_LEN + tail_len;
+        char *buf = xmalloc((size_t)new_len + 1);
+        memcpy(buf, DS4_NATIVE_KV_PREFIX, DS4_NATIVE_KV_PREFIX_LEN);
+        memcpy(buf + DS4_NATIVE_KV_PREFIX_LEN,
+               kv->key.ptr + DS4_UPSTREAM_KV_PREFIX_LEN, (size_t)tail_len);
+        buf[new_len] = '\0';
+
+        m->owned_kv_keys[i] = buf;
+        kv->key.ptr = buf;
+        kv->key.len = new_len;
+        renamed++;
+    }
+    if (renamed > 0) {
+        fprintf(stderr,
+                "ds4: --allow-upstream-names: remapped %" PRIu64 " of %" PRIu64
+                " metadata keys (deepseekv4.* -> deepseek4.*)\n",
+                renamed, m->n_kv);
+    }
+}
+
 /* Apply remap_upstream_tensor_name() to every tensor that looks like it uses
  * the upstream flavor.  Tensors that are already in DS4 form are kept as-is.
  * This is only called when the caller explicitly opts in. */
@@ -1427,7 +1481,10 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
     parse_metadata(m, &c);
     parse_tensors(m, &c);
 
-    if (allow_upstream_names) model_remap_upstream_names(m);
+    if (allow_upstream_names) {
+        model_remap_upstream_kv_keys(m);
+        model_remap_upstream_names(m);
+    }
 
     if (!metal_mapping && prefetch_cpu) model_prefetch_cpu_mapping(m);
 }
