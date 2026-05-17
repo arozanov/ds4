@@ -952,11 +952,10 @@ typedef struct {
      * rename happened for that tensor. */
     char **owned_names;
 
-    /* Same idea for metadata keys.  When --allow-upstream-names is used we may
-     * rewrite the "deepseekv4." prefix to "deepseek4." in place so that the
-     * rest of the loader can look up keys with its canonical names.  Entries
-     * are NULL unless that KV record was renamed. */
-    char **owned_kv_keys;
+    /* When set, the loader was opened with --allow-upstream-names.  The
+     * required_* metadata helpers consult this flag and substitute V4 Flash
+     * defaults for keys that the upstream / HF GGUF flavor never emits. */
+    bool allow_upstream_names;
 } ds4_model;
 
 static uint64_t scalar_value_size(uint32_t type) {
@@ -1113,10 +1112,6 @@ static void model_close(ds4_model *m) {
     if (m->owned_names) {
         for (uint64_t i = 0; i < m->n_tensors; i++) free(m->owned_names[i]);
         free(m->owned_names);
-    }
-    if (m->owned_kv_keys) {
-        for (uint64_t i = 0; i < m->n_kv; i++) free(m->owned_kv_keys[i]);
-        free(m->owned_kv_keys);
     }
     if (m->map) munmap((void *)m->map, (size_t)m->size);
     if (m->fd >= 0) close(m->fd);
@@ -1353,50 +1348,6 @@ static char *remap_upstream_tensor_name(const char *name) {
     return NULL;
 }
 
-/* Upstream/HF llama.cpp uses the architecture string "deepseekv4" while the
- * DS4 GGUF flavor uses "deepseek4".  All architecture-scoped metadata keys
- * therefore carry one of these two prefixes ("<arch>.attention.kv_lora_rank"
- * etc.) and the only difference is the prefix itself.  Rewrite the prefix on
- * any KV record that uses the upstream form so the rest of the loader can
- * look up keys with their canonical DS4 names.  Returns the number of keys
- * that were renamed. */
-#define DS4_UPSTREAM_KV_PREFIX     "deepseekv4."
-#define DS4_UPSTREAM_KV_PREFIX_LEN (sizeof(DS4_UPSTREAM_KV_PREFIX) - 1)
-#define DS4_NATIVE_KV_PREFIX       "deepseek4."
-#define DS4_NATIVE_KV_PREFIX_LEN   (sizeof(DS4_NATIVE_KV_PREFIX) - 1)
-
-static void model_remap_upstream_kv_keys(ds4_model *m) {
-    if (!m->n_kv) return;
-    m->owned_kv_keys = xcalloc((size_t)m->n_kv, sizeof(m->owned_kv_keys[0]));
-
-    uint64_t renamed = 0;
-    for (uint64_t i = 0; i < m->n_kv; i++) {
-        ds4_kv *kv = &m->kv[i];
-        if (kv->key.len <= DS4_UPSTREAM_KV_PREFIX_LEN) continue;
-        if (memcmp(kv->key.ptr, DS4_UPSTREAM_KV_PREFIX,
-                   DS4_UPSTREAM_KV_PREFIX_LEN) != 0) continue;
-
-        const uint64_t tail_len = kv->key.len - DS4_UPSTREAM_KV_PREFIX_LEN;
-        const uint64_t new_len = DS4_NATIVE_KV_PREFIX_LEN + tail_len;
-        char *buf = xmalloc((size_t)new_len + 1);
-        memcpy(buf, DS4_NATIVE_KV_PREFIX, DS4_NATIVE_KV_PREFIX_LEN);
-        memcpy(buf + DS4_NATIVE_KV_PREFIX_LEN,
-               kv->key.ptr + DS4_UPSTREAM_KV_PREFIX_LEN, (size_t)tail_len);
-        buf[new_len] = '\0';
-
-        m->owned_kv_keys[i] = buf;
-        kv->key.ptr = buf;
-        kv->key.len = new_len;
-        renamed++;
-    }
-    if (renamed > 0) {
-        fprintf(stderr,
-                "ds4: --allow-upstream-names: remapped %" PRIu64 " of %" PRIu64
-                " metadata keys (deepseekv4.* -> deepseek4.*)\n",
-                renamed, m->n_kv);
-    }
-}
-
 /* Apply remap_upstream_tensor_name() to every tensor that looks like it uses
  * the upstream flavor.  Tensors that are already in DS4 form are kept as-is.
  * This is only called when the caller explicitly opts in. */
@@ -1481,10 +1432,8 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
     parse_metadata(m, &c);
     parse_tensors(m, &c);
 
-    if (allow_upstream_names) {
-        model_remap_upstream_kv_keys(m);
-        model_remap_upstream_names(m);
-    }
+    m->allow_upstream_names = allow_upstream_names;
+    if (allow_upstream_names) model_remap_upstream_names(m);
 
     if (!metal_mapping && prefetch_cpu) model_prefetch_cpu_mapping(m);
 }
@@ -2302,18 +2251,116 @@ typedef struct {
  * lookup.  Shape validation is intentionally strict.
  */
 
+/* V4 Flash defaults for metadata keys that are present in DS4's native GGUF
+ * flavor but not always emitted by the upstream / Hugging Face llama.cpp
+ * converter for DeepSeek-V4 Flash.  The required_* helpers consult these
+ * tables only when --allow-upstream-names is in effect, so DS4-native GGUFs
+ * are still loaded strictly.  Values are taken from the V4 Flash paper and
+ * the mlx-lm reference implementation. */
+typedef struct {
+    const char *key;
+    uint32_t    value;
+} ds4_upstream_default_u32;
+
+typedef struct {
+    const char *key;
+    float       value;
+} ds4_upstream_default_f32;
+
+typedef struct {
+    const char *key;
+    bool        value;
+} ds4_upstream_default_bool;
+
+static const ds4_upstream_default_u32 ds4_upstream_defaults_u32[] = {
+    /* Attention LoRA / output projection shape. */
+    { "deepseek4.attention.output_lora_rank",    1024 },
+    { "deepseek4.attention.kv_lora_rank",        512  },
+    { "deepseek4.attention.output_group_count", 8    },
+    /* Indexer (DeepSeek Sparse Attention) topology. */
+    { "deepseek4.attention.indexer.head_count", 16   },
+    { "deepseek4.attention.indexer.key_length", 64   },
+    { "deepseek4.attention.indexer.top_k",      512  },
+    /* HyperConnections mixer. */
+    { "deepseek4.hyper_connection.count",                 4 },
+    { "deepseek4.hyper_connection.sinkhorn_iterations",   8 },
+    /* MTP / hash-routed dense layer count. */
+    { "deepseek4.hash_layer_count",             3    },
+};
+
+static const ds4_upstream_default_f32 ds4_upstream_defaults_f32[] = {
+    /* RoPE base for the compressed (long-context) lane.  Upstream GGUFs only
+     * ship deepseek4.rope.freq_base and deepseek4.rope.freq_base_swa, but DS4
+     * also wants the compressed-lane base separately. */
+    { "deepseek4.attention.compress_rope_freq_base", 160000.0f },
+    /* HyperConnections normalization epsilon. */
+    { "deepseek4.hyper_connection.epsilon",          1.0e-6f   },
+};
+
+static const ds4_upstream_default_bool ds4_upstream_defaults_bool[] = {
+    /* Placeholder for future bool keys; kept so the lookup helper compiles
+     * even when the table is empty. */
+    { NULL, false },
+};
+
+static bool ds4_upstream_default_u32_lookup(const char *key, uint32_t *out) {
+    for (size_t i = 0; i < sizeof(ds4_upstream_defaults_u32) /
+                              sizeof(ds4_upstream_defaults_u32[0]); i++) {
+        if (strcmp(ds4_upstream_defaults_u32[i].key, key) == 0) {
+            *out = ds4_upstream_defaults_u32[i].value;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool ds4_upstream_default_f32_lookup(const char *key, float *out) {
+    for (size_t i = 0; i < sizeof(ds4_upstream_defaults_f32) /
+                              sizeof(ds4_upstream_defaults_f32[0]); i++) {
+        if (strcmp(ds4_upstream_defaults_f32[i].key, key) == 0) {
+            *out = ds4_upstream_defaults_f32[i].value;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool ds4_upstream_default_bool_lookup(const char *key, bool *out) {
+    for (size_t i = 0; i < sizeof(ds4_upstream_defaults_bool) /
+                              sizeof(ds4_upstream_defaults_bool[0]); i++) {
+        if (ds4_upstream_defaults_bool[i].key &&
+            strcmp(ds4_upstream_defaults_bool[i].key, key) == 0) {
+            *out = ds4_upstream_defaults_bool[i].value;
+            return true;
+        }
+    }
+    return false;
+}
+
 static uint32_t required_u32(const ds4_model *m, const char *key) {
     uint32_t v = 0;
-    if (!model_get_u32(m, key, &v)) {
-        fprintf(stderr, "ds4: required metadata key is missing: %s\n", key);
-        exit(1);
+    if (model_get_u32(m, key, &v)) return v;
+    if (m->allow_upstream_names && ds4_upstream_default_u32_lookup(key, &v)) {
+        fprintf(stderr,
+                "ds4: using V4 Flash default for missing key: %s = %u\n",
+                key, v);
+        return v;
     }
-    return v;
+    fprintf(stderr, "ds4: required metadata key is missing: %s\n", key);
+    exit(1);
 }
 
 static uint64_t required_u64(const ds4_model *m, const char *key) {
     ds4_kv *kv = model_find_kv(m, key);
     if (!kv) {
+        uint32_t v32 = 0;
+        if (m->allow_upstream_names &&
+            ds4_upstream_default_u32_lookup(key, &v32)) {
+            fprintf(stderr,
+                    "ds4: using V4 Flash default for missing key: %s = %u\n",
+                    key, v32);
+            return (uint64_t)v32;
+        }
         fprintf(stderr, "ds4: required metadata key is missing: %s\n", key);
         exit(1);
     }
@@ -2337,6 +2384,14 @@ static uint64_t required_u64(const ds4_model *m, const char *key) {
 static float required_f32(const ds4_model *m, const char *key) {
     ds4_kv *kv = model_find_kv(m, key);
     if (!kv) {
+        float v = 0.0f;
+        if (m->allow_upstream_names &&
+            ds4_upstream_default_f32_lookup(key, &v)) {
+            fprintf(stderr,
+                    "ds4: using V4 Flash default for missing key: %s = %.9g\n",
+                    key, (double)v);
+            return v;
+        }
         fprintf(stderr, "ds4: required metadata key is missing: %s\n", key);
         exit(1);
     }
@@ -2369,11 +2424,15 @@ static float required_f32(const ds4_model *m, const char *key) {
 
 static bool required_bool(const ds4_model *m, const char *key) {
     bool v = false;
-    if (!model_get_bool(m, key, &v)) {
-        fprintf(stderr, "ds4: required metadata key is missing: %s\n", key);
-        exit(1);
+    if (model_get_bool(m, key, &v)) return v;
+    if (m->allow_upstream_names && ds4_upstream_default_bool_lookup(key, &v)) {
+        fprintf(stderr,
+                "ds4: using V4 Flash default for missing key: %s = %s\n",
+                key, v ? "true" : "false");
+        return v;
     }
-    return v;
+    fprintf(stderr, "ds4: required metadata key is missing: %s\n", key);
+    exit(1);
 }
 
 static ds4_tensor *required_tensor(const ds4_model *m, const char *name) {
@@ -2658,6 +2717,12 @@ static void validate_compress_ratio_metadata(const ds4_model *m) {
     ds4_array_ref arr;
     if (!model_get_array(m, key, &arr) ||
         (arr.type != GGUF_VALUE_UINT32 && arr.type != GGUF_VALUE_INT32)) {
+        if (m->allow_upstream_names) {
+            fprintf(stderr,
+                    "ds4: using V4 Flash default for missing array key: %s\n",
+                    key);
+            return;
+        }
         fprintf(stderr, "ds4: required int32/uint32 array metadata key is missing: %s\n", key);
         exit(1);
     }
@@ -2694,6 +2759,12 @@ static void validate_swiglu_clamp_metadata(const ds4_model *m) {
     ds4_array_ref arr;
     if (!model_get_array(m, key, &arr) ||
         (arr.type != GGUF_VALUE_FLOAT32 && arr.type != GGUF_VALUE_FLOAT64)) {
+        if (m->allow_upstream_names) {
+            fprintf(stderr,
+                    "ds4: using V4 Flash default for missing array key: %s\n",
+                    key);
+            return;
+        }
         fprintf(stderr, "ds4: required float array metadata key is missing: %s\n", key);
         exit(1);
     }
